@@ -1,0 +1,36 @@
+{
+  "name": "cloud-docs-home",
+  "author": "wujiaqi & Forge",
+  "url": "https://github.com/verygoodwu/cloud-docs-home",
+  "version": "0.12.7",
+  "minAppVersion": "3.8.2",
+  "backends": [
+    "all"
+  ],
+  "frontends": [
+    "desktop",
+    "desktop-window",
+    "browser-desktop"
+  ],
+  "displayName": {
+    "default": "Cloud Docs Home",
+    "zh_CN": "云文档"
+  },
+  "description": {
+    "default": "Browse notebooks and find documents.",
+    "zh_CN": "知识库导航、文档搜索与快捷访问"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh_CN": "README.md"
+  },
+  "icon": "icon.png",
+  "keywords": [
+    "首页",
+    "云文档",
+    "飞书",
+    "homepage",
+    "卡片"
+  ],
+  "preview": "preview.png"
+}

@@ -1,0 +1,25 @@
+name: Release Cloud Docs Home
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --check index.js && node --test navigation.test.cjs
+      - run: zip -9 package.zip index.js index.css plugin.json README.md LICENSE icon.png preview.png
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: package.zip
+          fail_on_unmatched_files: true
+          body: 修复切换知识库时旧请求覆盖当前目录的问题。
