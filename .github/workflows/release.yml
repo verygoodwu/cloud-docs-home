@@ -22,4 +22,4 @@ jobs:
         with:
           files: package.zip
           fail_on_unmatched_files: true
-          body: 修复切换知识库时旧请求覆盖当前目录的问题。
+          body: 清理思源「最近关闭的标签」中指向已删除文档的记录。

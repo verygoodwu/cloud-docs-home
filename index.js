@@ -4,6 +4,13 @@
  */
 "use strict";
 const { Plugin, Menu, openTab, Dialog, getFrontend, showMessage } = require("siyuan");
+const CLOSED_TABS_KEY = "local-closed-tabs";
+const SIYUAN_NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
+const closedTabSnapshot = tabs => JSON.stringify(tabs, (_key, value) =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
+    : value
+);
 
 
 // Restrained, theme-aware line icons. No external resources or injected document data.
@@ -364,6 +371,75 @@ class CloudDocsHome extends Plugin {
 
     // 打开思源后默认进入云文档首页（每次启动，可在首页右上角 ⚙ 关闭）
     this.ensureStartupHome(open);
+    this.onClosedTabDelete = ({ detail }) => {
+      if (detail?.cmd === "removeDoc") this.scheduleClosedTabCleanup();
+    };
+    this.eventBus.on("ws-main", this.onClosedTabDelete);
+  }
+
+  onLayoutReady() {
+    if (this.lifecycle) this.scheduleClosedTabCleanup();
+  }
+
+  scheduleClosedTabCleanup() {
+    clearTimeout(this.closedTabTimer);
+    this.closedTabTimer = setTimeout(() => {
+      if (this.closedTabCleanupRunning) {
+        this.scheduleClosedTabCleanup();
+        return;
+      }
+      this.closedTabCleanupRunning = true;
+      this.pruneClosedTabs().catch(() => this.trace?.("closed tab cleanup skipped"))
+        .finally(() => { this.closedTabCleanupRunning = false; });
+    }, 1500);
+  }
+
+  async pruneClosedTabs() {
+    const host = globalThis.siyuan;
+    const storage = host?.storage;
+    const app = this.app?.appId;
+    const signal = this.lifecycle?.signal;
+    const tabs = storage?.[CLOSED_TABS_KEY];
+    if (!signal || signal.aborted || !app || host.isPublish || host.config?.readonly || !Array.isArray(tabs)) return;
+
+    const snapshot = closedTabSnapshot(tabs);
+    const editor = tab => {
+      const data = tab?.children;
+      return data?.instance === "Editor" && SIYUAN_NODE_ID.test(data.rootId) &&
+        SIYUAN_NODE_ID.test(data.notebookId) ? data : null;
+    };
+    const editors = tabs.map(editor).filter(Boolean);
+    if (!editors.length) return;
+
+    const { notebooks } = await this.api("/api/notebook/lsNotebooks", {});
+    const openBoxes = new Set(notebooks.filter(book => book.closed === false).map(book => book.id));
+    const eligible = editors.filter(data => openBoxes.has(data.notebookId));
+    if (!eligible.length) return;
+
+    const quoted = values => [...new Set(values)].map(id => `'${id}'`).join(",");
+    const roots = quoted(eligible.map(data => data.rootId));
+    const boxes = quoted(eligible.map(data => data.notebookId));
+    const rows = await this.api("/api/query/sql", {
+      stmt: `SELECT id, box FROM blocks WHERE type='d' AND id IN (${roots})
+        UNION ALL SELECT '' AS id, box FROM blocks WHERE type='d' AND box IN (${boxes}) GROUP BY box`
+    });
+    if (!Array.isArray(rows)) return;
+    const live = new Set(rows.filter(row => row.id).map(row => row.id));
+    const indexed = new Set(rows.filter(row => row.id === "").map(row => row.box));
+    const keep = tabs.filter(tab => {
+      const data = editor(tab);
+      return !data || !indexed.has(data.notebookId) || live.has(data.rootId);
+    });
+    if (keep.length === tabs.length) return;
+
+    // Skip a write if another client or the current window changed the list during lookup.
+    const latest = await this.api("/api/storage/getLocalStorage", {});
+    if (signal.aborted || host.storage !== storage || closedTabSnapshot(storage[CLOSED_TABS_KEY]) !== snapshot ||
+      closedTabSnapshot(latest?.[CLOSED_TABS_KEY]) !== snapshot) return;
+    await this.api("/api/storage/setLocalStorageVal", { app, key: CLOSED_TABS_KEY, val: keep });
+    if (!signal.aborted && host.storage === storage && closedTabSnapshot(storage[CLOSED_TABS_KEY]) === snapshot) {
+      storage[CLOSED_TABS_KEY] = keep;
+    }
   }
 
   /* ---------- 用知识库首页取代思源的空白欢迎页 ---------- */
@@ -689,6 +765,8 @@ class CloudDocsHome extends Plugin {
   }
 
   onunload() {
+    clearTimeout(this.closedTabTimer);
+    if (this.onClosedTabDelete) this.eventBus.off("ws-main", this.onClosedTabDelete);
     this.emptyObserver?.disconnect();
     this.emptyObserver = null;
     clearTimeout(this.navTabTimer);

@@ -2,7 +2,7 @@
   "name": "cloud-docs-home",
   "author": "wujiaqi & Forge",
   "url": "https://github.com/verygoodwu/cloud-docs-home",
-  "version": "0.12.7",
+  "version": "0.12.8",
   "minAppVersion": "3.8.2",
   "backends": [
     "all"
