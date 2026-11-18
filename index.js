@@ -19,6 +19,11 @@ function uiIcon(kind) {
     book: '<path d="M4 3h12a1 1 0 0 1 1 1v14H5a2 2 0 0 1-2-2V5a2 2 0 0 1 1-2Z"/><path d="M3 15h14M7 3v12"/>',
     folder: '<path d="M2 6a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"/>',
     file: '<path d="M5 2h6l5 5v11H5Z"/><path d="M11 2v5h5M8 11h5M8 14h5"/>',
+    spreadsheet: '<rect x="3" y="4" width="14" height="12" rx="2"/><path d="M3 8h14M3 12h14M9 8v8"/>',
+    mindmap: '<rect x="2" y="8" width="5" height="4" rx="1"/><rect x="13" y="3" width="5" height="4" rx="1"/><rect x="13" y="13" width="5" height="4" rx="1"/><path d="M7 10h3V5h3m-3 5v5h3"/>',
+    whiteboard: '<rect x="2" y="3" width="16" height="14" rx="2"/><path d="M6 7h5v5H6zM13 12h2m-1-1v2"/>',
+    text: '<path d="M5 2h6l5 5v11H5Z"/><path d="M11 2v5h5m-7 3-2 2 2 2m3-4 2 2-2 2"/>',
+    pdf: '<path d="M5 2h6l5 5v11H5Z"/><path d="M11 2v5h5M7 14l2-4 2 4m1 0v-4h2"/>',
     home: '<path d="m2 9 8-7 8 7M4 8v10h12V8M8 18v-6h4v6"/>',
     search: '<circle cx="8" cy="8" r="5"/><path d="m12 12 5 5"/>',
     chevron: '<path d="m7 5 5 5-5 5"/>',
@@ -79,6 +84,11 @@ const isVisibleDoc = r => !!r && !isRootDoc(r) && !isConflictDoc(r);
  * 属性写在文档的 ial 里，会跟着思源同步走，换设备也在。
  */
 const isFolderRow = r => /custom-cdh-folder\s*=\s*"?true"?/.test(String(r?.ial ?? ""));
+const suiteFileLabels = new Map([
+  ["spreadsheet", "电子表格"], ["mindmap", "脑图"], ["xmind", "XMind 脑图"], ["whiteboard", "白板"],
+  ["text", "文本文件"], ["pdf", "PDF 文件"]
+]);
+const suiteFileKind = row => String(row?.ial ?? "").match(/(?:^|\s|\{)custom-cloud-document-kind\s*=\s*"([a-z-]+)"/)?.[1];
 
 /** 把「xxx (Conflicted 2026-09-03 10:21:03) (Conflicted …)」压成「xxx ×3」，
  *  只冲突过一次的补上发生时间，否则同名的几条在侧栏里分不出来 */
@@ -117,7 +127,6 @@ function greeting() {
   const h = new Date().getHours();
   if (h < 6) return "夜深了"; if (h < 11) return "早上好"; if (h < 14) return "中午好"; if (h < 18) return "下午好"; return "晚上好";
 }
-const dateText = () => new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(new Date());
 
 /* ---------- 剪贴板 ---------- */
 async function copyText(text) {
@@ -504,6 +513,7 @@ class CloudDocsHome extends Plugin {
 
   /** 导航需要的轻量状态（不查全量文档，比 fetchState 便宜） */
   async fetchNavState() {
+    await this.loadConfig();
     const [nbData, counts] = await Promise.all([
       this.api("/api/notebook/lsNotebooks", {}),
       this.api("/api/query/sql", { stmt: "SELECT box, COUNT(id) AS c FROM blocks WHERE type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %' GROUP BY box" })
@@ -536,6 +546,7 @@ class CloudDocsHome extends Plugin {
       return;
     }
     const request = this.boxDocsRequest = (this.boxDocsRequest || 0) + 1;
+    if (nav.openBoxId !== box) nav.folderSelection = null;
     nav.openBoxId = box;
     nav.boxDocs = null; nav.boxError = "";
     const st = this.loadExpanded(box);
@@ -561,6 +572,7 @@ class CloudDocsHome extends Plugin {
     const nav = this.nav;
     this.boxDocsRequest = (this.boxDocsRequest || 0) + 1;
     nav.openBoxId = null; nav.boxDocs = null; nav.boxError = "";
+    nav.folderSelection = null;
     nav.expanded = new Set(); nav.closed = new Set(); nav.showConflicts = false;
     this.showHome();
     this.syncViews();
@@ -808,14 +820,95 @@ class CloudDocsHome extends Plugin {
 
   async loadConfig() {
     if (this.config) return this.config;
-    try {
-      const s = await this.loadData("config.json");
-      this.config = s ? (typeof s === "string" ? JSON.parse(s) : s) : null;
-    } catch { this.config = null; }
-    if (!this.config || !Array.isArray(this.config.pins)) this.config = { pins: [] };
-    return this.config;
+    if (!this.configLoading) {
+      this.configLoading = (async () => {
+        const raw = await this.loadData("config.json");
+        const config = typeof raw === "string" ? (raw ? JSON.parse(raw) : null) : raw;
+        if (config != null && (typeof config !== "object" || Array.isArray(config))) {
+          throw Error("云文档配置格式异常，已停止保存，请检查或恢复配置文件");
+        }
+        const result = config || {};
+        if (result.pins !== undefined && !Array.isArray(result.pins)) {
+          throw Error("云文档置顶配置格式异常，已停止保存");
+        }
+        result.pins ||= [];
+        if (result.navigationOrder !== undefined && !Array.isArray(result.navigationOrder)) {
+          throw Error("云文档排序配置格式异常，已停止保存");
+        }
+        this.config = result;
+        if (this.nav) this.nav.sortMode = ["manual", "name", "time"].includes(result.documentSortMode)
+          ? result.documentSortMode : result.navigationOrder?.length ? "manual" : "name";
+        return result;
+      })();
+    }
+    try { return await this.configLoading; }
+    finally { this.configLoading = null; }
   }
-  async saveConfig() { await this.saveData("config.json", this.config); }
+
+  async saveConfig() {
+    const config = await this.loadConfig();
+    await this.saveData("config.json", config);
+  }
+
+  queueNavigationChange(change) {
+    const pending = (this.navigationChange || Promise.resolve()).catch(() => {}).then(change);
+    this.navigationChange = pending;
+    return pending;
+  }
+
+  async setSortMode(mode) {
+    return this.queueNavigationChange(async () => {
+      const config = await this.loadConfig();
+      const previous = config.documentSortMode;
+      const previousMode = this.nav.sortMode;
+      config.documentSortMode = ["manual", "time"].includes(mode) ? mode : "name";
+      this.nav.sortMode = config.documentSortMode;
+      try { await this.saveConfig(); }
+      catch (error) {
+        config.documentSortMode = previous;
+        this.nav.sortMode = previousMode;
+        throw error;
+      }
+      this.navView?.render();
+      this.syncViews();
+    });
+  }
+
+  manualOrder(a, b) {
+    const ids = this.config?.navigationOrder || [];
+    const left = ids.indexOf(a), right = ids.indexOf(b);
+    if (left < 0 && right < 0) return 0;
+    if (left < 0) return 1;
+    if (right < 0) return -1;
+    return left - right;
+  }
+
+  async reorderNavigation(source, target, after, siblings, isDocument = true) {
+    return this.queueNavigationChange(async () => {
+      const config = await this.loadConfig();
+      const ids = siblings.filter(id => id !== source);
+      if (!ids.includes(target) || source === target) return;
+      ids.splice(ids.indexOf(target) + (after ? 1 : 0), 0, source);
+      const previous = config.navigationOrder;
+      const previousMode = config.documentSortMode;
+      const previousNavMode = this.nav?.sortMode;
+      config.navigationOrder = [...(previous || []).filter(id => !siblings.includes(id)), ...ids];
+      if (isDocument) {
+        config.documentSortMode = "manual";
+        if (this.nav) this.nav.sortMode = "manual";
+      }
+      try { await this.saveConfig(); }
+      catch (error) {
+        config.navigationOrder = previous;
+        config.documentSortMode = previousMode;
+        if (this.nav) this.nav.sortMode = previousNavMode;
+        throw error;
+      }
+      this.navView?.render();
+      await this.syncViews();
+    });
+  }
+
 
   async fetchState() {
     const [nbData, docs, counts] = await Promise.all([
@@ -879,7 +972,7 @@ class CloudDocsHome extends Plugin {
    *  这里不做过过滤，冲突副本由渲染层收进「同步冲突」入口，避免把数据藏死。 */
   async fetchBoxDocs(box) {
     const rows = await this.api("/api/query/sql", {
-      stmt: `SELECT id, box, hpath, content, updated, ial FROM blocks WHERE type='d' AND box='${sqlSafe(box)}' ORDER BY hpath LIMIT 3000`
+      stmt: `SELECT id, box, path, hpath, content, updated, ial FROM blocks WHERE type='d' AND box='${sqlSafe(box)}' ORDER BY hpath LIMIT 3000`
     }) || [];
     // 把还没被索引的新文档补回去；索引追上后自动移除（超过 30 秒没人认领就丢弃）
     for (const [id, item] of [...this.pendingDocs]) {
@@ -949,7 +1042,7 @@ class CloudDocsHome extends Plugin {
     hit.hpath = newHp;
     for (const r of rows) {
       const hp = String(r.hpath || "");
-      if (hp.startsWith(oldHp + "/")) r.hpath = newHp + hp.slice(oldHp.length);
+      if (hp.startsWith(oldHp + "/") && (!hit.path || this.isSelfOrDescendant(hit, r))) r.hpath = newHp + hp.slice(oldHp.length);
     }
   }
 
@@ -958,7 +1051,9 @@ class CloudDocsHome extends Plugin {
     if (!rows) return;
     const hit = rows.find(r => r.id === id);
     const hp = hit ? String(hit.hpath || "") : "";
-    this.nav.boxDocs = rows.filter(r => r.id !== id && !(hp && String(r.hpath || "").startsWith(hp + "/")));
+    this.nav.boxDocs = rows.filter(r => hit?.path
+      ? !this.isSelfOrDescendant(hit, r)
+      : r.id !== id && !(hp && String(r.hpath || "").startsWith(hp + "/")));
     this.pendingDocs.delete(id);
   }
 
@@ -969,7 +1064,9 @@ class CloudDocsHome extends Plugin {
     const rows = this.nav.boxDocs;
     if (!rows || rows.some(r => r.id === row.id)) return;
     rows.push(row);
-    const parent = String(row.hpath || "").replace(/[^/]*$/, "").replace(/^\/+|\/+$/g, "");
+    const parent = row.path && row.path.lastIndexOf("/") > 0
+      ? row.path.slice(0, row.path.lastIndexOf("/")) + ".sy"
+      : String(row.hpath || "").replace(/[^/]*$/, "").replace(/^\/+|\/+$/g, "");
     if (parent) {
       this.nav.expanded.add(parent);
       this.nav.closed?.delete(parent);
@@ -986,8 +1083,8 @@ class CloudDocsHome extends Plugin {
   /** 是不是自己或自己的子文档（移动时防止移进自己的子孙） */  isSelfOrDescendant(doc, other) {
     if (!doc || !other) return false;
     if (other.id === doc.id) return true;
-    const hp = String(doc.hpath || "");
-    return !!hp && String(other.hpath || "").startsWith(hp + "/");
+    const path = String(doc.path || "").replace(/\.sy$/, "");
+    return doc.box === other.box && !!path && String(other.path || "").startsWith(path + "/");
   }
 
   async renameDoc(doc) {
@@ -1030,7 +1127,7 @@ class CloudDocsHome extends Plugin {
     // 只传父路径会建出一篇和父文档同名的新文档（实测过，会造重复）。
     const parent = String(doc.hpath || "").replace(/\/+$/, "");
     const path = `${parent}/${title.replace(/\//g, "_")}`;
-    const data = await this.api("/api/filetree/createDocWithMd", { notebook: doc.box, path, title, markdown: "" });
+    const data = await this.api("/api/filetree/createDocWithMd", { notebook: doc.box, path, parentID: doc.id, title, markdown: "" });
     const id = typeof data === "string" ? data : (data?.id || data?.root_id || null);
     if (id) this.addDocLocal({ id, box: doc.box, hpath: path, content: title, updated: this.stampNow() });
     this.navView?.render();
@@ -1067,7 +1164,7 @@ class CloudDocsHome extends Plugin {
      · 树里显示 📁，点一下只展开/收起，不会把你的空壳文档打开；
      · 里面放子文档（右键「新建子文档」或直接拖），和真文件夹用起来一样。 */
 
-  async newFolderIn(box, parentHpath) {
+  async newFolderIn(box, parentHpath, parentID) {
     if (!box) return;
     let title = "";
     const ok = await showModal({
@@ -1082,7 +1179,7 @@ class CloudDocsHome extends Plugin {
     if (!ok) return;
     const parent = String(parentHpath || "/").replace(/\/+$/, "");
     const path = `${parent}/${title.replace(/\//g, "_")}`;
-    const data = await this.api("/api/filetree/createDocWithMd", { notebook: box, path, title, markdown: "" });
+    const data = await this.api("/api/filetree/createDocWithMd", { notebook: box, path, parentID, title, markdown: "" });
     const id = typeof data === "string" ? data : (data?.id || data?.root_id || null);
     if (!id) { showMessage("创建文件夹失败", 3200, "error"); return; }
     try { await this.api("/api/attr/setBlockAttrs", { id, attrs: { "custom-cdh-folder": "true" } }); }
@@ -1191,9 +1288,13 @@ class CloudDocsHome extends Plugin {
       }
     });
     if (!ok || !target) return;
-    const toID = target.parent || target.box;
+    await this.moveDocTo(doc, target.parent || target.box);
+  }
+
+  async moveDocTo(doc, toID) {
     if (toID === doc.id) throw Error("不能移动到它自己下面");
     await this.api("/api/filetree/moveDocsByID", { fromIDs: [doc.id], toID });
+    this.pendingDocs.delete(doc.id);
     showMessage("已移动", 1800);
     await this.afterDocChange();
   }
@@ -1213,7 +1314,7 @@ class CloudDocsHome extends Plugin {
     return [
       { icon: "iconFile", label: folder ? "打开（编辑这篇文件夹）" : "打开", click: () => this.openDoc(doc.id) },
       { icon: "iconAdd", label: "新建子文档", click: () => this.newChildDoc(doc) },
-      { icon: "iconFolder", label: "新建子文件夹", click: () => this.newFolderIn(doc.box, "/" + String(doc.hpath || "").replace(/^\/+/, "")) },
+      { icon: "iconFolder", label: "新建子文件夹", click: () => this.newFolderIn(doc.box, doc.hpath, doc.id) },
       { sep: true },
       { icon: "iconEdit", label: "重命名", click: () => this.renameDoc(doc) },
       { icon: "iconCopy", label: "创建副本", click: () => this.duplicateDoc(doc) },
@@ -1281,7 +1382,7 @@ class CloudDocsHome extends Plugin {
     await this.afterDocChange();
   }
 
-  openCreateDialog(state, defaultBox) {
+  openCreateDialog(state, defaultBox, defaultParent) {
     const openNbs = state.notebooks.filter(n => !n.closed);
     if (!openNbs.length) { showMessage("没有打开的笔记本，请先创建或打开笔记本", 3000, "error"); return; }
     const preBox = defaultBox && openNbs.some(n => n.id === defaultBox) ? defaultBox : openNbs[0].id;
@@ -1291,6 +1392,8 @@ class CloudDocsHome extends Plugin {
       content: `<div class="b3-dialog__content" style="display:grid;gap:12px">
         <label class="ft__on-surface">标题<input class="b3-text-field" data-cdh-title placeholder="无标题" style="width:100%;margin-top:6px"></label>
         <label class="ft__on-surface">笔记本<select class="b3-select" data-cdh-box style="width:100%;margin-top:6px">${openNbs.map(n => `<option value="${esc(n.id)}"${n.id === preBox ? " selected" : ""}>${esc(n.name)}</option>`).join("")}</select></label>
+        <label class="ft__on-surface">保存位置<select class="b3-select" data-cdh-parent style="width:100%;margin-top:6px"></select></label>
+        <div class="ft__secondary" data-cdh-location-status></div>
       </div>
       <div class="b3-dialog__action">
         <button class="b3-button b3-button--cancel" data-cdh-cancel>取消</button>
@@ -1299,20 +1402,52 @@ class CloudDocsHome extends Plugin {
     });
     const el = dialog.element;
     const titleInput = el.querySelector("[data-cdh-title]");
+    const boxInput = el.querySelector("[data-cdh-box]");
+    const parentInput = el.querySelector("[data-cdh-parent]");
+    const status = el.querySelector("[data-cdh-location-status]");
+    const btn = el.querySelector("[data-cdh-create]");
+    let locations = [];
+    let request = 0;
+    const loadLocations = async (preferred = "") => {
+      const pending = ++request;
+      btn.disabled = parentInput.disabled = true;
+      status.textContent = "正在读取保存位置…";
+      try {
+        const rows = await this.fetchBoxDocs(boxInput.value);
+        if (pending !== request) return;
+        locations = rows.filter(isVisibleDoc).sort((a, b) => String(a.hpath || "").localeCompare(String(b.hpath || ""), "zh-CN", { numeric: true }));
+        parentInput.innerHTML = '<option value="">笔记本根目录</option>' + locations.map(row =>
+          `<option value="${esc(row.id)}">${esc(row.hpath)}</option>`).join("");
+        if (locations.some(row => row.id === preferred)) parentInput.value = preferred;
+        status.textContent = "";
+        btn.disabled = parentInput.disabled = false;
+      } catch (e) {
+        if (pending === request) status.textContent = "读取目录失败：" + (e?.message || e);
+      }
+    };
+    boxInput.addEventListener("change", () => void loadLocations());
+    void loadLocations(defaultParent ?? (preBox === this.nav.folderSelection?.box ? this.nav.folderSelection.id : ""));
     titleInput.focus();
     const close = () => dialog.destroy();
     el.querySelector("[data-cdh-cancel]").addEventListener("click", close);
     el.querySelector("[data-cdh-create]").addEventListener("click", async () => {
-      const btn = el.querySelector("[data-cdh-create]"); btn.disabled = true;
+      btn.disabled = boxInput.disabled = parentInput.disabled = true;
       try {
         const title = titleInput.value.trim() || "无标题";
-        const box = el.querySelector("[data-cdh-box]").value;
-        // path 要带上标题：只传 "/" 会建出一篇名字空掉的新文档
-        const data = await this.api("/api/filetree/createDocWithMd", { notebook: box, path: "/" + title.replace(/\//g, "_"), title, markdown: "" });
+        const box = boxInput.value;
+        const parent = locations.find(row => row.id === parentInput.value);
+        const path = `${String(parent?.hpath || "").replace(/\/+$/, "")}/${title.replace(/\//g, "_")}`;
+        const data = await this.api("/api/filetree/createDocWithMd", { notebook: box, path, parentID: parent?.id, title, markdown: "" });
         close();
         const id = typeof data === "string" ? data : (data?.id || data?.root_id || null);
+        if (parent && this.nav.openBoxId === box) {
+          const folderPath = parent.path || parent.hpath.replace(/^\/+/, "");
+          this.nav.expanded.add(folderPath);
+          this.nav.closed?.delete(folderPath);
+        }
+        await this.afterDocChange();
         if (id) await this.openDoc(id); else showMessage("文档已创建");
-      } catch (e) { btn.disabled = false; showMessage("创建失败：" + (e?.message || e), 4000, "error"); }
+      } catch (e) { btn.disabled = boxInput.disabled = parentInput.disabled = false; showMessage("创建失败：" + (e?.message || e), 4000, "error"); }
     });
   }
 
@@ -1377,6 +1512,11 @@ class NavView {
       this.menuFor(t, null, { x: event.clientX, y: event.clientY });
     };
     this.el.addEventListener("contextmenu", this.handleContext);
+    this.el.addEventListener("dragstart", this.startDocDrag);
+    this.el.addEventListener("dragover", this.overDocDrop);
+    this.el.addEventListener("dragleave", this.leaveDocDrop);
+    this.el.addEventListener("drop", this.dropDoc);
+    this.el.addEventListener("dragend", this.endDocDrag);
     this.refresh();
   }
 
@@ -1385,10 +1525,124 @@ class NavView {
     CdMenu.close();
     this.el.removeEventListener("click", this.handleClick);
     this.el.removeEventListener("contextmenu", this.handleContext);
+    this.el.removeEventListener("dragstart", this.startDocDrag);
+    this.el.removeEventListener("dragover", this.overDocDrop);
+    this.el.removeEventListener("dragleave", this.leaveDocDrop);
+    this.el.removeEventListener("drop", this.dropDoc);
+    this.el.removeEventListener("dragend", this.endDocDrag);
+    this.endDocDrag();
     this.el.innerHTML = "";
   }
 
   run(fn) { Promise.resolve().then(fn).catch(e => showMessage(e?.message || e, 4000, "error")); }
+
+  startDocDrag = event => {
+    const row = event.target.closest?.('.cdh-tree-row[draggable="true"], .cdh-side-item[data-menu="box"]');
+    if (row?.dataset.menu === "box" && event.dataTransfer && !this.movingDoc) {
+      this.draggedDoc = { id: row.dataset.box, notebook: true };
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("application/x-cloud-docs-home-document", row.dataset.box);
+      return;
+    }
+    const doc = this.plugin.nav.boxDocs?.find(item => item.id === row?.dataset.id);
+    if (!doc || !event.dataTransfer || this.movingDoc) return;
+    this.draggedDoc = doc;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-cloud-docs-home-document", doc.id);
+  };
+
+  docDropTarget(event) {
+    if (!this.draggedDoc || !Array.from(event.dataTransfer?.types || []).includes("application/x-cloud-docs-home-document")) return null;
+    if (this.draggedDoc.notebook) {
+      const scroll = event.target.closest?.(".cdh-side-scroll");
+      if (scroll && this.el.contains(scroll)) {
+        const rows = [...scroll.querySelectorAll('.cdh-side-item[data-menu="box"]')]
+          .filter(item => item.dataset.box !== this.draggedDoc.id);
+        const row = rows.find(item => {
+          const rect = item.getBoundingClientRect();
+          return event.clientY < rect.top + rect.height / 2;
+        }) || rows.at(-1);
+        if (!row) return null;
+        const rect = row.getBoundingClientRect();
+        return { row, id: row.dataset.box, order: event.clientY < rect.top + rect.height / 2 ? "before" : "after" };
+      }
+    }
+    const row = event.target.closest?.('.cdh-tree-row[data-menu="doc"], .cdh-side-item[data-menu="box"]');
+    if (!row || !this.el.contains(row)) return null;
+    if (row.dataset.menu === "box") {
+      if (!this.draggedDoc.notebook) return { row, id: row.dataset.box };
+      if (row.dataset.box === this.draggedDoc.id) return null;
+      const rect = row.getBoundingClientRect();
+      return { row, id: row.dataset.box, order: event.clientY >= rect.top + rect.height / 2 ? "after" : "before" };
+    }
+    if (this.draggedDoc.notebook) return null;
+    const doc = this.plugin.nav.boxDocs?.find(item => item.id === row.dataset.id);
+    if (!doc || this.plugin.isSelfOrDescendant(this.draggedDoc, doc)) return null;
+    const parent = item => String(item.path || "").slice(0, String(item.path || "").lastIndexOf("/"));
+    if (doc.box === this.draggedDoc.box && parent(doc) === parent(this.draggedDoc) && row.getBoundingClientRect) {
+      const rect = row.getBoundingClientRect();
+      const offset = event.clientY - rect.top;
+      if (offset < rect.height * 0.3 || offset > rect.height * 0.7) {
+        return { row, id: doc.id, order: offset < rect.height / 2 ? "before" : "after" };
+      }
+    }
+    return { row, id: doc.id };
+  }
+
+  highlightDocDrop(row) {
+    if (this.dropRow === row) return;
+    this.dropRow?.classList.remove("cdh-drop-target", "cdh-drop-before", "cdh-drop-after");
+    this.dropRow = row;
+    row?.classList.add("cdh-drop-target");
+  }
+
+  overDocDrop = event => {
+    const target = this.docDropTarget(event);
+    this.highlightDocDrop(target?.row);
+    target?.row.classList.toggle?.("cdh-drop-before", target.order === "before");
+    target?.row.classList.toggle?.("cdh-drop-after", target.order === "after");
+    target?.row.classList.toggle?.("cdh-drop-target", !target.order);
+    if (!target) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  };
+
+  leaveDocDrop = event => {
+    if (!this.dropRow?.contains(event.relatedTarget)) this.highlightDocDrop();
+  };
+
+  endDocDrag = () => {
+    this.highlightDocDrop();
+    this.draggedDoc = null;
+  };
+
+  dropDoc = event => {
+    const target = this.docDropTarget(event);
+    const doc = this.draggedDoc;
+    this.endDocDrag();
+    if (!target || event.dataTransfer.getData("application/x-cloud-docs-home-document") !== doc.id) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.movingDoc = true;
+    this.run(async () => {
+      try {
+        if (target.order) {
+          const parent = item => String(item.path || "").slice(0, String(item.path || "").lastIndexOf("/"));
+          const siblings = doc.notebook
+            ? [...(this.state?.openNotebooks || [])].sort((a, b) => this.plugin.manualOrder(a.id, b.id)).map(item => item.id)
+            : (this.plugin.nav.boxDocs || []).filter(item => item.box === doc.box && parent(item) === parent(doc))
+                .sort((a, b) => (this.plugin.nav.sortMode === "manual" ? this.plugin.manualOrder(a.id, b.id) : 0) ||
+                  (this.plugin.nav.sortMode === "time" ? String(b.updated || "").localeCompare(String(a.updated || "")) : 0) ||
+                  String(a.content || "").localeCompare(String(b.content || ""), "zh-CN", { numeric: true }))
+                .map(item => item.id);
+          await this.plugin.reorderNavigation(doc.id, target.id, target.order === "after", siblings, !doc.notebook);
+        } else {
+          await this.plugin.moveDocTo(doc, target.id);
+        }
+      }
+      finally { this.movingDoc = false; }
+    });
+  };
 
   async refresh() {
     try { this.state = await this.plugin.fetchNavState(); }
@@ -1422,11 +1676,11 @@ class NavView {
             <span class="cdh-side-ico">${uiIcon("home")}</span><span class="cdh-side-name">首页</span>
           </button>
           <div class="cdh-side-label">知识库</div>
-          ${s.openNotebooks.map(n => {
+          ${[...s.openNotebooks].sort((a, b) => this.plugin.manualOrder(a.id, b.id)).map(n => {
             const { emoji, text } = splitNotebookName(n.name);
             const on = nav.openBoxId === n.id;
             return `
-            <button class="cdh-side-item${on ? " is-on" : ""}" data-act="openBox" data-box="${esc(n.id)}" data-menu="box"
+            <button class="cdh-side-item${on ? " is-on" : ""}" draggable="true" data-act="openBox" data-box="${esc(n.id)}" data-menu="box"
                     title="${esc(text)}${on ? " · 再点一次收起" : ""}" aria-expanded="${on ? "true" : "false"}">
               <span class="cdh-side-chevron${on ? " is-open" : ""}">${uiIcon("chevron")}</span><span class="cdh-side-dot">${uiIcon("book")}</span>
               <span class="cdh-side-name">${esc(text)}</span>
@@ -1508,11 +1762,7 @@ class NavView {
       }
     }
     html += docs.length
-      ? `<div class="cdh-tree-tools">
-           <span class="cdh-tree-count">${docs.length} 篇</span>
-           <button data-act="expandAll" title="展开所有层级（库很大时会很长）">全部展开</button>
-           <button data-act="collapseAll" title="只留顶层，其余收起">全部收起</button>
-         </div>` + this.renderTree(this.buildTree(docs))
+      ? this.renderTree(this.buildTree(docs))
       : `<div class="cdh-side-tip">这个库还没有正文文档</div>`;
     return html;
   }
@@ -1522,6 +1772,15 @@ class NavView {
     const trail = new Set();
     const cur = (this.plugin.nav.boxDocs || []).find(r => r.id === this.plugin.docCtxId);
     if (!cur?.hpath) return trail;
+    if (cur.path) {
+      const parts = cur.path.split("/").filter(Boolean);
+      let parentPath = "";
+      for (const part of parts.slice(0, -1)) {
+        parentPath += "/" + part;
+        trail.add(parentPath + ".sy");
+      }
+      return trail;
+    }
     const parts = String(cur.hpath).split("/").filter(Boolean);
     let acc = "";
     for (let i = 0; i < parts.length - 1; i++) {
@@ -1544,6 +1803,8 @@ class NavView {
     const nav = this.plugin.nav;
     const trail = this.currentTrail();
     const cmp = (a, b) => {
+      const manual = nav.sortMode === "manual" ? this.plugin.manualOrder(a.doc?.id, b.doc?.id) : 0;
+      if (manual) return manual;
       if (nav.sortMode === "time") {
         const ta = a.doc?.updated || "", tb = b.doc?.updated || "";
         if (ta !== tb) return tb.localeCompare(ta);
@@ -1555,9 +1816,11 @@ class NavView {
       for (const k of [...node.children.values()].sort(cmp)) {
         const hasKids = k.children.size > 0;
         const isDoc = !!k.doc;
-        const isFolder = !!(k.folder || (isDoc && isFolderRow(k.doc)));
+        const isFolder = !isDoc || k.folder;
         const open = hasKids && this.isOpen(k.path, depth, trail);
-        const icon = uiIcon(isFolder || !isDoc ? "folder" : "file");
+        const fileKind = isDoc && !isFolder ? suiteFileKind(k.doc) : null;
+        const fileLabel = suiteFileLabels.get(fileKind);
+        const iconKind = isFolder ? "folder" : fileKind === "xmind" ? "mindmap" : fileLabel ? fileKind : "file";
         // 每一行都带 data-menu：右键和 hover 出来的「⋯」用的是同一套菜单
         const menuAttrs = isDoc
           ? `data-menu="doc" data-id="${esc(k.doc.id)}" data-box="${esc(k.doc.box)}"`
@@ -1566,14 +1829,15 @@ class NavView {
         const action = isFolder
           ? (hasKids ? `data-act="toggle" data-path="${esc(k.path)}"` : `data-act="folderEmpty"`)
           : (isDoc ? `data-act="open" data-id="${esc(k.doc.id)}"` : (hasKids ? `data-act="toggle" data-path="${esc(k.path)}"` : ""));
-        const hint = isFolder ? " · 文件夹" : (isDoc ? " · 更新于 " + esc(relTime(k.doc.updated)) : "");
+        const hint = isFolder ? " · 文件夹" : ` · ${fileLabel || "文档"} · 更新于 ${esc(relTime(k.doc.updated))}`;
         out.push(`
           <div class="cdh-tree-row${isDoc ? "" : " cdh-tree-group"}${isFolder ? " is-folder" : ""}${isDoc && k.doc.id === this.plugin.docCtxId ? " is-current" : ""}" style="--depth:${depth}"
+               ${isDoc ? 'draggable="true"' : ""}
                ${menuAttrs}
                ${action}
                title="${esc(prettyDocName(k.name))}${hint}">
-            <span class="cdh-tree-toggle${hasKids ? "" : " is-empty"}"${hasKids ? ` data-act="toggle" data-path="${esc(k.path)}"` : ""}>${hasKids ? (open ? "▾" : "▸") : "·"}</span>
-            <span class="cdh-tree-icon">${icon}</span>
+            ${hasKids ? `<button type="button" class="cdh-tree-toggle" data-act="toggle" data-path="${esc(k.path)}" aria-expanded="${open}" aria-label="${open ? "收起" : "展开"} ${esc(prettyDocName(k.name))}">${uiIcon("chevron")}</button>` : '<span class="cdh-tree-toggle is-empty" aria-hidden="true"></span>'}
+            <span class="cdh-tree-icon${fileLabel ? ` cdh-file-${iconKind}` : ""}">${uiIcon(iconKind)}</span>
             <span class="cdh-tree-name">${esc(prettyDocName(k.name))}</span>
             ${isDoc ? `<time>${esc(relTime(k.doc.updated))}</time>` : `<small>${k.children.size} 项</small>`}
             <span class="cdh-tree-more" data-act="menu" ${menuAttrs} title="更多操作">⋯</span>
@@ -1587,6 +1851,18 @@ class NavView {
 
   /** 把 hpath（形如 /A/B/C）拼成层级树；思源里中间层通常也是文档，故节点可能自带 doc */  buildTree(rows) {
     const root = { name: "", path: "", children: new Map(), doc: null };
+    if (rows.length && rows.every(row => typeof row.path === "string" && row.path.endsWith(".sy"))) {
+      const nodes = new Map(rows.map(row => [row.path, {
+        name: String(row.content || row.hpath?.split("/").at(-1) || "未命名文档"),
+        path: row.path, children: new Map(), doc: row, folder: isFolderRow(row)
+      }]));
+      for (const node of nodes.values()) {
+        const slash = node.path.lastIndexOf("/");
+        const parent = slash > 0 ? nodes.get(node.path.slice(0, slash) + ".sy") : null;
+        (parent || root).children.set(node.doc.id, node);
+      }
+      return root;
+    }
     for (const r of rows) {
       const hp = String(r.hpath || "").replace(/^\/+|\/+$/g, "");
       const parts = hp ? hp.split("/").filter(Boolean) : [];
@@ -1618,6 +1894,10 @@ class NavView {
     const on = p.nav.openBoxId === nb.id;
     return [
       { icon: on ? "iconDown" : "iconForward", label: on ? "收起目录" : "展开目录", click: () => on ? p.goHome() : p.goBox(nb.id) },
+      ...(on && p.nav.boxDocs?.length ? [
+        { icon: "iconDown", label: "全部展开", click: () => this.onAction("expandAll") },
+        { icon: "iconForward", label: "全部收起", click: () => this.onAction("collapseAll") }
+      ] : []),
       { icon: "iconAdd", label: "新建文档", click: () => p.newDocIn(nb.id, "/") },
       { icon: "iconFolder", label: "新建文件夹", click: () => p.newFolderIn(nb.id, "/") },
       { icon: "iconRefresh", label: "刷新目录", click: () => p.goBox(nb.id, { force: true }) },
@@ -1674,6 +1954,10 @@ class NavView {
 
   async onAction(act, id, el) {
     const plugin = this.plugin, nav = plugin.nav;
+    const folder = el?.closest(".cdh-tree-row.is-folder[data-id]");
+    if (folder && (act === "toggle" || act === "folderEmpty")) {
+      nav.folderSelection = { id: folder.dataset.id, box: folder.dataset.box };
+    }
     if (act === "home") return plugin.goHome();
     if (act === "openBox") {
       const box = el?.dataset.box || "";
@@ -1693,19 +1977,19 @@ class NavView {
     if (act === "conflicts") { nav.showConflicts = !nav.showConflicts; return this.render(); }
     if (act === "expandAll" || act === "collapseAll") {
       const all = new Set();
-      for (const r of (nav.boxDocs || [])) {
-        const hp = String(r.hpath || "").replace(/^\/+|\/+$/g, "");
-        if (!hp) continue;
-        const parts = hp.split("/");
-        let acc = "";
-        for (let i = 0; i < parts.length - 1; i++) { acc = acc ? acc + "/" + parts[i] : parts[i]; all.add(acc); }
-      }
+      const collect = node => {
+        for (const child of node.children.values()) {
+          if (child.children.size) all.add(child.path);
+          collect(child);
+        }
+      };
+      collect(this.buildTree(nav.boxDocs || []));
       if (act === "expandAll") { nav.expanded = all; nav.closed = new Set(); }
       else { nav.expanded = new Set(); nav.closed = all; }
       plugin.saveExpanded();
       return this.render();
     }
-    if (act === "sort") { nav.sortMode = el.dataset.mode === "time" ? "time" : "name"; this.render(); return plugin.syncViews(); }
+    if (act === "sort") return plugin.setSortMode(el.dataset.mode);
     if (act === "open" && id) return plugin.openDoc(id);
     if (act === "menu") {
       // 延到本次 click 处理完之后再开：思源在 document 上挂了「点任何地方关菜单」，
@@ -1843,6 +2127,10 @@ class HomeView {
     const s = this.state; if (!s || this.disposed) return;
     const nav = this.plugin.nav;
     if (nav.openBoxId && !s.notebooks.some(n => n.id === nav.openBoxId)) nav.openBoxId = null;
+    if (this.browseBox !== nav.openBoxId) {
+      this.browseBox = nav.openBoxId;
+      this.browseParent = "";
+    }
     const prev = keepScroll ? (this.root.querySelector(".cdh-pane")?.scrollTop || 0) : 0;
     // 导航常驻在 Dock 里，标签页内只剩内容区，整块宽度都留给内容
     this.root.innerHTML = `
@@ -1857,11 +2145,15 @@ class HomeView {
     const s = this.state;
     const pinned = s.config.pins.filter(p => p.id && p.title);
     return `
-      <header class="cdh-banner">
+      <header class="cdh-banner cdh-banner--home">
+        <div class="cdh-box-banner-content">
         <div class="cdh-banner-top">
-          <div class="cdh-greet"><h1>文档</h1><p>${dateText()} · 共 ${s.totalDocs} 篇文档</p></div>
+          <div class="cdh-home-title">
+            <span class="cdh-box-cover">${uiIcon("book")}</span>
+            <div class="cdh-greet"><h1>知识库</h1><p>${s.openNotebooks.length} 个知识库 · ${s.totalDocs} 篇文档</p></div>
+          </div>
           <div class="cdh-banner-actions">
-            <button class="cdh-gear" data-act="settings" title="首页设置">⚙</button>
+            <button class="cdh-gear" data-act="settings" aria-label="首页设置" title="首页设置">⚙</button>
             <button class="cdh-new" data-act="create">＋ 新建</button>
           </div>
         </div>
@@ -1870,24 +2162,24 @@ class HomeView {
           <input data-cdh-search aria-label="搜索文档标题" placeholder="搜索文档标题…" autocomplete="off">
           <div class="cdh-search-results" role="listbox" aria-label="搜索结果"></div>
         </div>
+        </div>
       </header>
-      <main class="cdh-main">
-        <section class="cdh-section">
+      <main class="cdh-main cdh-home-main">
+        ${pinned.length ? `<section class="cdh-section">
           <div class="cdh-section-head"><h2>快捷访问</h2></div>
           <div class="cdh-pins">
-            ${pinned.length ? pinned.map((p, i) => `
+            ${pinned.map(p => `
               <div class="cdh-pin" data-act="open" data-id="${esc(p.id)}" >
                 <span class="cdh-pin-emoji">${uiIcon("pin")}</span>
                 <div class="cdh-pin-text"><b>${esc(p.title)}</b></div>
                 <button class="cdh-pin-remove" data-act="unpin" data-id="${esc(p.id)}" title="移除">✕</button>
-              </div>`).join("")
-            : '<div class="cdh-hint">把常用文档「置顶」后就会出现在这里</div>'}
+              </div>`).join("")}
           </div>
-        </section>
+        </section>` : ""}
         <section class="cdh-section">
           <div class="cdh-section-head"><h2>我的知识库</h2><button class="cdh-refresh" data-act="refresh" title="刷新">⟳</button></div>
           <div class="cdh-grid">
-            ${s.openNotebooks.map(n => this.notebookCard(n)).join("") || '<div class="cdh-hint">还没有打开的笔记本</div>'}
+            ${[...s.openNotebooks].sort((a, b) => this.plugin.manualOrder(a.id, b.id)).map(n => this.notebookCard(n)).join("") || '<div class="cdh-hint">还没有打开的笔记本</div>'}
           </div>
           ${s.closedCount ? `<div class="cdh-closed-hint">另有 ${s.closedCount} 个已关闭的笔记本未显示</div>` : ""}
         </section>
@@ -1912,72 +2204,108 @@ class HomeView {
     const newest = s.newestByBox[n.id];
     const count = s.countMap[n.id] || 0;
     const { emoji, text } = splitNotebookName(n.name);
-    const cover = emoji || emojiOf(n.id);
     const meta = `${count} 篇文档${newest ? " · 更新于 " + relTime(newest.updated) : ""}`;
     return `
-      <div class="cdh-card" data-act="openBox" data-box="${esc(n.id)}" title="查看「${esc(text)}」的目录">
-        <div class="cdh-cover">${uiIcon("book")}</div>
-        <div class="cdh-card-body">
+      <button type="button" class="cdh-card" draggable="true" data-act="openBox" data-box="${esc(n.id)}" title="查看「${esc(text)}」的目录">
+        <span class="cdh-cover" aria-hidden="true">${emoji ? esc(emoji) : uiIcon("book")}</span>
+        <span class="cdh-card-body">
           <b>${esc(text)}</b>
           <small>${esc(meta)}</small>
-        </div>
-        <div class="cdh-card-more">查看目录 →</div>
-      </div>`;
+        </span>
+        <span class="cdh-card-arrow">${uiIcon("chevron")}</span>
+      </button>`;
   }
 
   boxPaneHTML() {
     const s = this.state;
     const n = s.notebooks.find(x => x.id === this.openBoxId) || s.notebooks[0];
     if (!n) return '<div class="cdh-hint">没有可用的知识库</div>';
-    const { emoji, text } = splitNotebookName(n.name);
+    const { text } = splitNotebookName(n.name);
     const docs = this.treeDocs();
     const conflicts = this.conflictDocs();
     const count = this.boxDocs ? docs.length : (s.countMap[n.id] || 0);
-    const recent = docs.slice().sort((a, b) => String(b.updated).localeCompare(String(a.updated))).slice(0, 15);
+    const byId = new Map(docs.map(doc => [doc.id, doc]));
+    const byPath = new Map(docs.filter(doc => doc.path).map(doc => [doc.path, doc.id]));
+    const byTitlePath = new Map(docs.map(doc => [doc.hpath, doc.id]));
+    const parentIds = new Map();
+    const children = new Map();
+    for (const doc of docs) {
+      const parentPath = String(doc.path || "").replace(/\/[^/]+$/, "");
+      const titleParentPath = String(doc.hpath || "").replace(/\/[^/]+$/, "");
+      const parentId = (doc.path ? byPath.get(parentPath + ".sy") : titleParentPath && byTitlePath.get(titleParentPath)) || "";
+      parentIds.set(doc.id, parentId);
+      if (!children.has(parentId)) children.set(parentId, []);
+      children.get(parentId).push(doc);
+    }
+    const folder = byId.get(this.browseParent);
+    const trail = [];
+    for (let item = folder; item; item = byId.get(parentIds.get(item.id))) trail.unshift(item);
+    const rows = (children.get(folder?.id || "") || []).sort((a, b) => {
+      const manual = this.sortMode === "manual" ? this.plugin.manualOrder(a.id, b.id) : 0;
+      if (manual) return manual;
+      const order = this.sortMode === "time" ? String(b.updated || "").localeCompare(String(a.updated || "")) : 0;
+      return order || String(a.content || "").localeCompare(String(b.content || ""), "zh-CN", { numeric: true });
+    });
 
     let body;
     if (this.boxError) {
       body = `<div class="cdh-hint cdh-error">读取目录失败：${esc(this.boxError)}</div>`;
     } else if (!this.boxDocs) {
       body = '<div class="cdh-loading">正在读取目录…</div>';
-    } else if (!docs.length) {
-      body = '<div class="cdh-hint">这个知识库还没有文档，点右上角「＋ 新建」开始</div>';
+    } else if (!rows.length) {
+      body = `<div class="cdh-hint">${folder ? "此目录暂无子文档" : "这个知识库还没有文档"}</div>`;
     } else {
-      body = recent.map(r => `
-        <div class="cdh-recent-row" data-act="open" data-id="${esc(r.id)}" data-menu="doc"
+      body = rows.map(r => {
+        const kind = suiteFileKind(r);
+        const childCount = children.get(r.id)?.length || 0;
+        const browse = isFolderRow(r) || childCount > 0;
+        const icon = browse ? "folder" : kind === "xmind" ? "mindmap" : suiteFileLabels.has(kind) ? kind : "file";
+        return `
+        <button type="button" class="cdh-recent-row cdh-directory-row" data-act="${browse ? "browse" : "open"}" data-id="${esc(r.id)}" data-menu="doc"
              data-box="${esc(r.box)}" data-hpath="${esc(r.hpath || "")}" data-title="${esc(r.content)}">
-          <span class="cdh-row-icon">${uiIcon("file")}</span>
-          <div class="cdh-recent-text"><b>${esc(prettyDocName(r.content))}</b><small>${esc(String(r.hpath || "").replace(/^\/+|\/+$/g, "")) || "根目录"}</small></div>
+          <span class="cdh-row-icon cdh-list-icon-${icon}">${uiIcon(icon)}</span>
+          <span class="cdh-recent-text"><b>${esc(prettyDocName(r.content))}</b>${browse ? `<small>${childCount} 个子项</small>` : ""}</span>
           <time>${esc(relTime(r.updated))}</time>
-        </div>`).join("");
+          <span class="cdh-directory-arrow">${browse ? uiIcon("chevron") : ""}</span>
+        </button>`;
+      }).join("");
     }
 
     return `
       <header class="cdh-banner cdh-banner--box">
+        <div class="cdh-box-banner-content">
         <div class="cdh-banner-top">
           <button class="cdh-back" data-act="home">← 全部知识库</button>
           <div class="cdh-banner-actions">
-            <button class="cdh-new" data-act="create-here">＋ 新建</button>
+            <button class="cdh-new" data-act="create-here" data-id="${esc(folder?.id || "")}">＋ 新建</button>
           </div>
         </div>
         <div class="cdh-box-head">
           <div class="cdh-box-cover">${uiIcon("book")}</div>
           <div class="cdh-box-meta">
             <h1>${esc(text)}</h1>
-            <p>${count} 篇文档 · 目录见左侧</p>
+            <p>${count} 篇文档</p>
           </div>
         </div>
+        </div>
       </header>
-      <main class="cdh-main">
+      <main class="cdh-main cdh-box-main">
+        <section class="cdh-box-list" aria-label="目录">
         <div class="cdh-tree-toolbar">
-          <span class="cdh-tree-count">最近更新</span>
+          <nav class="cdh-directory-trail" aria-label="目录路径">
+            ${folder ? `<button type="button" data-act="browse">${esc(text)}</button>` : '<span aria-current="location">根目录</span>'}
+            ${trail.map(item => `<span aria-hidden="true">›</span>${item === folder
+              ? `<span aria-current="location">${esc(prettyDocName(item.content))}</span>`
+              : `<button type="button" data-act="browse" data-id="${esc(item.id)}">${esc(prettyDocName(item.content))}</button>`}`).join("")}
+          </nav>
           <div class="cdh-sort">
-            <button data-act="sort" data-mode="name" class="${this.sortMode === "name" ? "is-on" : ""}" title="左侧目录排序">名称</button>
-            <button data-act="sort" data-mode="time" class="${this.sortMode === "time" ? "is-on" : ""}" title="左侧目录排序">更新</button>
+            <button data-act="sort" data-mode="manual" class="${this.sortMode === "manual" ? "is-on" : ""}">手动</button>
+            <button data-act="sort" data-mode="name" class="${this.sortMode === "name" ? "is-on" : ""}">名称</button>
+            <button data-act="sort" data-mode="time" class="${this.sortMode === "time" ? "is-on" : ""}">更新</button>
           </div>
         </div>
         <div class="cdh-recent">${body}</div>
-        <div class="cdh-hint" style="margin-top:12px">左侧是该知识库的完整目录，点目录里的文档即可打开。</div>
+        </section>
         ${conflicts.length ? `<div class="cdh-hint cdh-hint--conflict">这个库还有 ${conflicts.length} 个同步冲突副本（标题带 <code>(Conflicted …)</code>），已折叠到左侧目录底部，需要时点开查看，不建议当作正文使用。</div>` : ""}
       </main>`;
   }
@@ -2003,12 +2331,12 @@ class HomeView {
       return box === nav.openBoxId ? this.plugin.goHome() : this.plugin.goBox(box);
     }
     if (act === "home") return this.plugin.goHome();
-    if (act === "sort") {
-      nav.sortMode = el.dataset.mode === "time" ? "time" : "name";
-      this.plugin.navView?.render();
-      return this.render();
+    if (act === "sort") return this.plugin.setSortMode(el.dataset.mode);
+    if (act === "browse") {
+      this.browseParent = id || "";
+      return this.render(false);
     }
-    if (act === "create-here") return this.plugin.openCreateDialog(s, nav.openBoxId);
+    if (act === "create-here") return this.plugin.openCreateDialog(s, nav.openBoxId, id || "");
     if (act === "open" && id) {
       if (el?.classList.contains("cdh-search-result")) {
         const input = this.root.querySelector("[data-cdh-search]");

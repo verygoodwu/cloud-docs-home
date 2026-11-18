@@ -22,4 +22,4 @@ jobs:
         with:
           files: package.zip
           fail_on_unmatched_files: true
-          body: 清理思源「最近关闭的标签」中指向已删除文档的记录。
+          body: 新增知识库与文档拖动排序，修复排序模式切换、首页顺序一致性、配置读取保护和同名目录显示。
