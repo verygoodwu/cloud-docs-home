@@ -314,6 +314,7 @@ class CloudDocsHome extends Plugin {
     this.navView = null;
     /* 刚建出来的文档在本地先挂着：内核 SQL 索引要几秒才追上，先显示出来用户才觉得"点了就生效" */
     this.pendingDocs = new Map();
+    this.deletedDocs = new Map();
 
     this.addIcons('<symbol id="iconCloudHome" viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" rx="8" fill="#3370ff"/><path d="M21.8 20.2a4.3 4.3 0 0 0-8.1-2.1 3.7 3.7 0 0 0 .4 7.3h7.2a3.9 3.9 0 0 0 .5-5.2z" fill="#fff"/><path d="M12.6 17.4h3.2M12.6 19.9h5.4" stroke="#3370ff" stroke-width="1.4" stroke-linecap="round"/></symbol>');
 
@@ -381,7 +382,23 @@ class CloudDocsHome extends Plugin {
     // 打开思源后默认进入云文档首页（每次启动，可在首页右上角 ⚙ 关闭）
     this.ensureStartupHome(open);
     this.onClosedTabDelete = ({ detail }) => {
-      if (detail?.cmd === "removeDoc") this.scheduleClosedTabCleanup();
+      if (detail?.cmd === "removeDoc") {
+        this.scheduleClosedTabCleanup();
+        for (const id of detail.data?.ids || []) this.dropDocLocal(id);
+      }
+      const structuralTransaction = detail?.cmd === "transactions" && Array.isArray(detail.data) &&
+        detail.data.some(transaction => (transaction.doOperations || []).some(operation =>
+          operation.action === "create" || operation.action === "restoreCreatedDoc"));
+      if (structuralTransaction || ["removeDoc", "moveDoc", "moveDocs", "rename", "createdailynote", "heading2doc", "li2doc"].includes(detail?.cmd)) {
+        if (structuralTransaction && detail.data.some(transaction =>
+          (transaction.doOperations || []).some(operation => operation.action === "restoreCreatedDoc"))) this.deletedDocs.clear();
+        this.navView?.render();
+        this.syncViews();
+        clearTimeout(this.documentEventTimer);
+        this.documentEventTimer = setTimeout(() => {
+          if (!this.lifecycle.signal.aborted) this.afterDocChange().catch(error => this.trace?.("directory refresh failed: " + error.message));
+        }, 250);
+      }
     };
     this.eventBus.on("ws-main", this.onClosedTabDelete);
   }
@@ -777,6 +794,7 @@ class CloudDocsHome extends Plugin {
   }
 
   onunload() {
+    clearTimeout(this.documentEventTimer);
     clearTimeout(this.closedTabTimer);
     if (this.onClosedTabDelete) this.eventBus.off("ws-main", this.onClosedTabDelete);
     this.emptyObserver?.disconnect();
@@ -786,6 +804,7 @@ class CloudDocsHome extends Plugin {
     clearTimeout(this.guardTimer);
     this.guardTimer = null;
     clearTimeout(this._afterTimer);
+    clearTimeout(this._reconcileTimer);
     try { this.navView?.dispose(); } catch { }
     this.navView = null;
     this.lifecycle?.abort();
@@ -920,7 +939,11 @@ class CloudDocsHome extends Plugin {
     const openNotebooks = notebooks.filter(n => !n.closed);
     const closedCount = notebooks.length - openNotebooks.length;
     const openBoxes = new Set(openNotebooks.map(n => n.id));
-    const rows = (docs || []).filter(r => openBoxes.has(r.box));
+    const rows = (docs || []).filter(r => openBoxes.has(r.box) && !this.hideDeletedDoc(r.id));
+    for (const [id, item] of this.pendingDocs || []) {
+      if (openBoxes.has(item.row.box) && !this.deletedDocs?.has(id) && !rows.some(row => row.id === id)) rows.push(item.row);
+    }
+    rows.sort((a, b) => String(b.updated || "").localeCompare(String(a.updated || "")));
     const countMap = {}; for (const r of counts || []) countMap[r.box] = r.c;
     const newestByBox = {}; const seen = new Set();
     for (const r of rows) if (!seen.has(r.box)) { seen.add(r.box); newestByBox[r.box] = r; }
@@ -981,7 +1004,19 @@ class CloudDocsHome extends Plugin {
       if (rows.some(r => r.id === id)) { this.pendingDocs.delete(id); continue; }
       rows.push(item.row);
     }
-    return rows;
+    const deleted = this.deletedDocs || new Map();
+    for (const [id, item] of deleted) {
+      if (item.box === box && !rows.some(row => row.id === id)) deleted.delete(id);
+    }
+    return rows.filter(row => !this.hideDeletedDoc(row.id));
+  }
+
+  hideDeletedDoc(id) {
+    const entry = this.deletedDocs?.get(id);
+    if (!entry) return false;
+    if (Date.now() - entry.at < 30000) return true;
+    this.deletedDocs.delete(id);
+    return false;
   }
 
   async searchDocs(q) {
@@ -1002,10 +1037,15 @@ class CloudDocsHome extends Plugin {
 
   /** 增删改后就地刷新：导航树 + 内容区，不跳页、不额外开标签 */
   async afterDocChange() {
+    this.navView?.render();
+    this.syncViews();
     await this.refreshAllViews();
+    if (this.lifecycle?.signal.aborted) return;
     // 思源的 SQL 索引有几百毫秒延迟：稍后再刷一次，免得树上还留着刚删掉的条目
     clearTimeout(this._afterTimer);
+    clearTimeout(this._reconcileTimer);
     this._afterTimer = setTimeout(() => { this.refreshAllViews().catch(() => { }); }, 1600);
+    this._reconcileTimer = setTimeout(() => { this.refreshAllViews().catch(() => { }); }, 5000);
   }
 
   async refreshAllViews() {
@@ -1046,23 +1086,41 @@ class CloudDocsHome extends Plugin {
     }
   }
 
-  dropDocLocal(id) {
-    const rows = this.nav.boxDocs;
-    if (!rows) return;
+  dropDocLocal(id, box) {
+    const rows = this.nav.boxDocs || [];
     const hit = rows.find(r => r.id === id);
     const hp = hit ? String(hit.hpath || "") : "";
-    this.nav.boxDocs = rows.filter(r => hit?.path
-      ? !this.isSelfOrDescendant(hit, r)
-      : r.id !== id && !(hp && String(r.hpath || "").startsWith(hp + "/")));
-    this.pendingDocs.delete(id);
+    this.deletedDocs ||= new Map();
+    const at = Date.now();
+    for (const [deletedId, entry] of this.deletedDocs) {
+      if (at - entry.at >= 30000) this.deletedDocs.delete(deletedId);
+    }
+    const isDeleted = row => row.id === id || (hit?.path
+      ? this.isSelfOrDescendant(hit, row)
+      : hp && row.box === hit.box && String(row.hpath || "").startsWith(hp + "/"));
+    const knownBox = box || hit?.box || this.pendingDocs.get(id)?.row.box || this.deletedDocs.get(id)?.box;
+    this.deletedDocs.set(id, { box: knownBox, at });
+    for (const row of [...rows, ...Array.from(this.pendingDocs.values(), item => item.row)]) {
+      if (!isDeleted(row)) continue;
+      this.deletedDocs.set(row.id, { box: row.box, at });
+      this.pendingDocs.delete(row.id);
+    }
+    if (this.nav.boxDocs) this.nav.boxDocs = rows.filter(row => !isDeleted(row));
   }
 
   /** 新建/复制的文档先插进本地树，并让它所在的父节点展开 */
-  addDocLocal(row) {
+  addDocLocal(row, parentID) {
     if (!row?.id) return;
+    const parentHpath = String(row.hpath || "").replace(/\/[^/]*$/, "");
+    const candidates = (this.nav.boxDocs || []).filter(item => item.box === row.box &&
+      (parentID ? item.id === parentID : item.hpath === parentHpath));
+    const parentDoc = candidates.length === 1 ? candidates[0] : null;
+    if (!row.path && parentDoc?.path) row.path = parentDoc.path.replace(/\.sy$/, "") + "/" + row.id + ".sy";
+    if (!row.path && !parentHpath) row.path = "/" + row.id + ".sy";
+    this.deletedDocs?.delete(row.id);
     this.pendingDocs.set(row.id, { row, at: Date.now() });
     const rows = this.nav.boxDocs;
-    if (!rows || rows.some(r => r.id === row.id)) return;
+    if (!rows || (this.nav.openBoxId && this.nav.openBoxId !== row.box) || rows.some(r => r.id === row.id)) return;
     rows.push(row);
     const parent = row.path && row.path.lastIndexOf("/") > 0
       ? row.path.slice(0, row.path.lastIndexOf("/")) + ".sy"
@@ -1129,7 +1187,7 @@ class CloudDocsHome extends Plugin {
     const path = `${parent}/${title.replace(/\//g, "_")}`;
     const data = await this.api("/api/filetree/createDocWithMd", { notebook: doc.box, path, parentID: doc.id, title, markdown: "" });
     const id = typeof data === "string" ? data : (data?.id || data?.root_id || null);
-    if (id) this.addDocLocal({ id, box: doc.box, hpath: path, content: title, updated: this.stampNow() });
+    if (id) this.addDocLocal({ id, box: doc.box, hpath: path, content: title, updated: this.stampNow() }, doc.id);
     this.navView?.render();
     await this.afterDocChange();
     if (id) await this.openDoc(id);
@@ -1184,7 +1242,7 @@ class CloudDocsHome extends Plugin {
     if (!id) { showMessage("创建文件夹失败", 3200, "error"); return; }
     try { await this.api("/api/attr/setBlockAttrs", { id, attrs: { "custom-cdh-folder": "true" } }); }
     catch (e) { showMessage("文件夹建好了，但标记失败：" + (e?.message || e), 3600, "error"); }
-    this.addDocLocal({ id, box, hpath: path, content: title, updated: this.stampNow(), ial: 'custom-cdh-folder="true"' });
+    this.addDocLocal({ id, box, hpath: path, content: title, updated: this.stampNow(), ial: 'custom-cdh-folder="true"' }, parentID);
     this.navView?.render();
     showMessage(`已创建文件夹「${title}」`, 2000);
     await this.afterDocChange();
@@ -1239,7 +1297,7 @@ class CloudDocsHome extends Plugin {
       await this.afterDocChange();
       throw e;
     }
-    this.dropDocLocal(doc.id);
+    this.dropDocLocal(doc.id, doc.box);
     if (this.docCtxId === doc.id) { this.docCtxId = null; this.docCtx = null; }
     this.navView?.render();
     showMessage("已删除", 1800);
@@ -1440,6 +1498,12 @@ class CloudDocsHome extends Plugin {
         const data = await this.api("/api/filetree/createDocWithMd", { notebook: box, path, parentID: parent?.id, title, markdown: "" });
         close();
         const id = typeof data === "string" ? data : (data?.id || data?.root_id || null);
+        if (id) {
+          this.addDocLocal({ id, box, hpath: path, content: title, updated: this.stampNow(),
+            path: parent?.path ? parent.path.replace(/\.sy$/, "") + "/" + id + ".sy" : parent ? undefined : "/" + id + ".sy" }, parent?.id);
+          this.navView?.render();
+          this.syncViews();
+        }
         if (parent && this.nav.openBoxId === box) {
           const folderPath = parent.path || parent.hpath.replace(/^\/+/, "");
           this.nav.expanded.add(folderPath);
@@ -2082,9 +2146,7 @@ class HomeView {
   run(fn) { fn().catch(e => showMessage(e?.message || e, 4000, "error")); }
   async refresh() {
     this.root.innerHTML = '<div class="cdh-loading">正在加载…</div>';
-    try { this.state = await this.plugin.fetchState(); }
-    catch (e) { this.root.innerHTML = `<div class="cdh-loading cdh-error">${esc(e?.message || e)}</div>`; return; }
-    this.render();
+    await this.reload(true);
   }
   hideSearch() {
     clearTimeout(this.searchTimer);
@@ -2096,8 +2158,17 @@ class HomeView {
   }
 
   /** 数据变了但不想闪"正在加载"：静默重拉，保持滚动位置 */
-  async reload() {
-    try { this.state = await this.plugin.fetchState(); } catch { return; }
+  async reload(showError = false) {
+    const request = this.stateRequest = (this.stateRequest || 0) + 1;
+    const current = () => !this.disposed && this.stateRequest === request;
+    try {
+      const state = await this.plugin.fetchState();
+      if (!current()) return;
+      this.state = state;
+    } catch (error) {
+      if (showError && current()) this.root.innerHTML = `<div class="cdh-loading cdh-error">${esc(error?.message || error)}</div>`;
+      return;
+    }
     this.render();
   }
 

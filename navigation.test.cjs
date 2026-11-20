@@ -10,6 +10,63 @@ const context = { module: { exports: {} }, require: () => ({ Plugin: class {}, s
 } }) };
 const [NavView, HomeView] = vm.runInNewContext(fs.readFileSync(path.join(__dirname, "index.js"), "utf8") + "\n[NavView, HomeView];", context);
 
+function directoryRefreshFixture() {
+  return Object.assign(Object.create(context.module.exports.prototype), {
+    nav: { openBoxId: "book-a", boxDocs: [], expanded: new Set() },
+    pendingDocs: new Map(),
+    deletedDocs: new Map(),
+    saveExpanded() {}
+  });
+}
+
+const documentInBookB = { id: "doc-b", box: "book-b", path: "/doc-b.sy", hpath: "/示例" };
+
+test("creating in another notebook does not insert into the open directory", () => {
+  const plugin = directoryRefreshFixture();
+  plugin.addDocLocal({ ...documentInBookB });
+  assert.equal(plugin.pendingDocs.has(documentInBookB.id), true);
+  assert.equal(plugin.nav.boxDocs.some(row => row.id === documentInBookB.id), false);
+});
+
+test("deletion clears a pending creation even when no directory is open", () => {
+  const plugin = directoryRefreshFixture();
+  plugin.nav.boxDocs = null;
+  plugin.pendingDocs.set(documentInBookB.id, { row: documentInBookB, at: Date.now() });
+  plugin.dropDocLocal(documentInBookB.id);
+  assert.equal(plugin.pendingDocs.has(documentInBookB.id), false);
+});
+
+test("homepage recent documents exclude a deleted item in another notebook", async () => {
+  const plugin = directoryRefreshFixture();
+  plugin.config = { pins: [] };
+  plugin.api = async (endpoint, body) => {
+    if (endpoint.endsWith("/lsNotebooks")) return { notebooks: [{ id: "book-b" }] };
+    return body.stmt.includes("COUNT") ? [] : [documentInBookB];
+  };
+  plugin.dropDocLocal(documentInBookB.id);
+  const { recent } = await plugin.fetchState();
+  assert.equal(recent.some(row => row.id === documentInBookB.id), false);
+});
+
+test("an older homepage refresh cannot replace a newer result", async () => {
+  const view = Object.create(HomeView.prototype);
+  let finishFirst;
+  let finishSecond;
+  const requests = [
+    new Promise(resolve => { finishFirst = resolve; }),
+    new Promise(resolve => { finishSecond = resolve; })
+  ];
+  view.plugin = { fetchState: () => requests.shift() };
+  view.render = () => {};
+  const first = view.reload();
+  const second = view.reload();
+  finishSecond({ recent: [] });
+  await second;
+  finishFirst({ recent: [documentInBookB] });
+  await first;
+  assert.equal(view.state.recent.length, 0);
+});
+
 test("closed tab cleanup preserves live, custom and unindexed tabs and skips a changed list", async () => {
   const key = "local-closed-tabs";
   const open = "20260101000000-openbox";
@@ -113,6 +170,10 @@ test("new document defaults to the clicked folder and creates under its ID", asy
   context.dialogElement = { querySelector: selector => fields[selector.slice(10, -1)] };
   plugin.fetchBoxDocs = async () => [folder];
   plugin.afterDocChange = async () => {};
+  plugin.pendingDocs = new Map();
+  plugin.views = new Set();
+  plugin.nav.boxDocs = [folder];
+  plugin.saveExpanded = () => {};
   let created, opened;
   plugin.api = async (_endpoint, body) => { created = body; return "new"; };
   plugin.openDoc = async id => { opened = id; };
@@ -123,6 +184,7 @@ test("new document defaults to the clicked folder and creates under its ID", asy
   assert.equal(created.parentID, folder.id);
   assert.equal(created.path, "/项目/资料/会议纪要");
   assert.equal(opened, "new");
+  assert.equal(plugin.nav.boxDocs.some(doc => doc.id === "new"), true);
 });
 
 test("compact tree separates folder expansion, document opening and typed files", () => {
@@ -304,4 +366,56 @@ test("same-title folders stay separate by physical document IDs", () => {
   assert.equal(tree.children.size, 2);
   assert.equal(tree.children.get("a").children.get("leaf").doc.id, "leaf");
   assert.equal(tree.children.get("b").children.size, 0);
+});
+
+test("created child stays visible while the SQL index still has the old list", async () => {
+  const plugin = Object.create(context.module.exports.prototype);
+  const parent = {id:"folder", box:"book", path:"/folder.sy", hpath:"/Same", content:"Same"};
+  plugin.nav = {boxDocs:[parent], expanded:new Set(), closed:new Set()};
+  plugin.pendingDocs = new Map();
+  plugin.deletedDocs = new Map();
+  plugin.saveExpanded = () => {};
+  plugin.api = async () => [{...parent}];
+  plugin.addDocLocal({id:"new",box:"book",hpath:"/Same/New",content:"New"}, "folder");
+  assert.equal(plugin.nav.boxDocs[1].path, "/folder/new.sy");
+  assert.equal(plugin.nav.expanded.has("/folder.sy"), true);
+  const rows = await plugin.fetchBoxDocs("book");
+  assert.equal(rows.some(row => row.id === "new"), true);
+});
+
+test("deleted subtree cannot return from a stale SQL response and same-name siblings remain", async () => {
+  const plugin = Object.create(context.module.exports.prototype);
+  const rows = [
+    {id:"folder",box:"book",path:"/folder.sy",hpath:"/Same"},
+    {id:"child",box:"book",path:"/folder/child.sy",hpath:"/Same/Child"},
+    {id:"other",box:"book",path:"/other.sy",hpath:"/Same"}
+  ];
+  plugin.nav = {boxDocs:rows.map(row=>({...row}))};
+  plugin.pendingDocs = new Map([["child",{row:rows[1],at:Date.now()}]]);
+  plugin.deletedDocs = new Map();
+  plugin.api = async () => rows.map(row=>({...row}));
+  plugin.dropDocLocal("folder");
+  assert.deepEqual(plugin.nav.boxDocs.map(row=>row.id), ["other"]);
+  assert.deepEqual((await plugin.fetchBoxDocs("book")).map(row=>row.id), ["other"]);
+  assert.equal(plugin.pendingDocs.has("child"), false);
+  plugin.api = async () => [rows[2]];
+  await plugin.fetchBoxDocs("book");
+  assert.equal(plugin.deletedDocs.size, 0);
+});
+
+test("document changes render local rows before a slow directory fetch resolves", async () => {
+  const plugin = Object.create(context.module.exports.prototype);
+  const seen = [];
+  let finish;
+  plugin.navView = {render:()=>seen.push("tree")};
+  plugin.syncViews = ()=>seen.push("content");
+  plugin.refreshAllViews = ()=>new Promise(resolve=>{finish=resolve});
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  try {
+    const pending = plugin.afterDocChange();
+    assert.deepEqual(seen,["tree","content"]);
+    finish();
+    await pending;
+  } finally {delete context.setTimeout;delete context.clearTimeout;}
 });

@@ -22,4 +22,4 @@ jobs:
         with:
           files: package.zip
           fail_on_unmatched_files: true
-          body: 新增知识库与文档拖动排序，修复排序模式切换、首页顺序一致性、配置读取保护和同名目录显示。
+          body: 修复新建和删除文档后目录未及时更新、跨知识库新建串入当前目录，以及首页旧请求覆盖新列表的问题。
