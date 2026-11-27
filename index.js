@@ -401,6 +401,9 @@ class CloudDocsHome extends Plugin {
       }
     };
     this.eventBus.on("ws-main", this.onClosedTabDelete);
+    document.addEventListener("cloud-docs-home:document-created", event => {
+      this.onSuiteDocumentCreated(event.detail).catch(error => this.trace?.("created document refresh failed: " + error.message));
+    }, { signal: this.lifecycle.signal });
     document.addEventListener("cloud-docs-home:reveal-imported-document", event => {
       const entry = event.detail;
       if (!entry?.id || !entry.box || !entry.path || !entry.hpath || !this.navVisible()) return;
@@ -1037,11 +1040,22 @@ class CloudDocsHome extends Plugin {
     catch (e) { showMessage("打开文档失败：" + (e?.message || e), 3000, "error"); }
   }
 
-  async revealImportedDocument(entry) {
+  addSuiteDocument(entry) {
+    if (!entry?.id || !entry.box || !entry.path || !entry.hpath) return false;
     const { id, box, path, hpath, title, kind } = entry;
     const row = { id, box, path, hpath, content: title, updated: this.stampNow() };
     if (typeof kind === "string" && /^[a-z-]+$/.test(kind)) row.ial = `custom-cloud-document-kind="${kind}"`;
     this.addDocLocal(row);
+    return true;
+  }
+
+  async onSuiteDocumentCreated(entry) {
+    if (this.addSuiteDocument(entry)) await this.afterDocChange();
+  }
+
+  async revealImportedDocument(entry) {
+    if (!this.addSuiteDocument(entry)) return;
+    const { id, box } = entry;
     void this.syncDocContext(id);
     if (this.nav.openBoxId !== box || !this.nav.boxDocs) await this.goBox(box, { keepEditor: true });
     if (this.lifecycle.signal.aborted || this.nav.openBoxId !== box || this.docCtxId !== id) return;
@@ -1137,8 +1151,8 @@ class CloudDocsHome extends Plugin {
     this.deletedDocs?.delete(row.id);
     this.pendingDocs.set(row.id, { row, at: Date.now() });
     const rows = this.nav.boxDocs;
-    if (!rows || (this.nav.openBoxId && this.nav.openBoxId !== row.box) || rows.some(r => r.id === row.id)) return;
-    rows.push(row);
+    if (!rows || (this.nav.openBoxId && this.nav.openBoxId !== row.box)) return;
+    if (!rows.some(r => r.id === row.id)) rows.push(row);
     const parent = row.path && row.path.lastIndexOf("/") > 0
       ? row.path.slice(0, row.path.lastIndexOf("/")) + ".sy"
       : String(row.hpath || "").replace(/[^/]*$/, "").replace(/^\/+|\/+$/g, "");

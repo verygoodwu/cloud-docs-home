@@ -21,6 +21,33 @@ function directoryRefreshFixture() {
 
 const documentInBookB = { id: "doc-b", box: "book-b", path: "/doc-b.sy", hpath: "/示例" };
 
+test("a new suite whiteboard appears under the right folder before the index refresh finishes", async () => {
+  const plugin = directoryRefreshFixture();
+  const folder = { id: "qa", box: "book-a", path: "/qa.sy", hpath: "/示例目录", ial: 'custom-cdh-folder="true"' };
+  const sameName = { ...folder, id: "other", path: "/other.sy" };
+  plugin.nav.boxDocs = [sameName, folder];
+  plugin.nav.closed = new Set([folder.path, sameName.path]);
+  plugin.docCtxId = "already-open";
+  plugin.syncViews = () => {};
+  plugin.lifecycle = new AbortController();
+  const view = Object.assign(Object.create(NavView.prototype), { plugin });
+  let html;
+  let finishRefresh;
+  plugin.navView = { render: () => { html = view.renderTree(view.buildTree(plugin.nav.boxDocs)); } };
+  plugin.refreshAllViews = () => new Promise(resolve => { finishRefresh = resolve; });
+  const refresh = plugin.onSuiteDocumentCreated({
+    id: "whiteboard", box: "book-a", path: "/qa/whiteboard.sy", hpath: "/示例目录/新建白板", title: "新建白板", kind: "whiteboard"
+  });
+  assert.match(html, /style="--depth:1"[^>]*data-id="whiteboard"/);
+  assert.match(html, /cdh-file-whiteboard/);
+  assert.deepEqual([...plugin.nav.expanded], [folder.path]);
+  assert.deepEqual([...plugin.nav.closed], [sameName.path]);
+  assert.equal(plugin.docCtxId, "already-open");
+  plugin.lifecycle.abort();
+  finishRefresh();
+  await refresh;
+});
+
 test("revealing an import expands its collapsed ancestors, highlights only the imported row and scrolls to it", async () => {
   const plugin = directoryRefreshFixture();
   const folder = { id: "outer", box: "book-a", path: "/outer.sy", hpath: "/外层" };
