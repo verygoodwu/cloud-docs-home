@@ -146,6 +146,31 @@ test("an older homepage refresh cannot replace a newer result", async () => {
   assert.equal(view.state.recent.length, 0);
 });
 
+test("an older sidebar refresh cannot replace a newer result", async () => {
+  const view = Object.create(NavView.prototype);
+  let finishFirst;
+  const requests = [new Promise(resolve => { finishFirst = resolve; }), Promise.resolve({ countMap: { book: 2 } })];
+  view.plugin = { fetchNavState: () => requests.shift() };
+  view.render = () => {};
+  const first = view.refresh();
+  await view.refresh();
+  finishFirst({ countMap: { book: 1 } });
+  await first;
+  assert.equal(view.state.countMap.book, 2);
+});
+
+test("a batch of created documents updates the sidebar once without changing the current selection", async () => {
+  const plugin = directoryRefreshFixture();
+  plugin.docCtxId = "current-document";
+  let refreshes = 0;
+  plugin.afterDocChange = async () => { refreshes++; };
+  const entries = ["one", "two"].map(id => ({ id, box: "book-a", path: `/${id}.sy`, hpath: `/${id}`, title: id }));
+  await plugin.onSuiteDocumentCreated(entries);
+  assert.deepEqual(plugin.nav.boxDocs.map(row => row.id), ["one", "two"]);
+  assert.equal(refreshes, 1);
+  assert.equal(plugin.docCtxId, "current-document");
+});
+
 test("closed tab cleanup preserves live, custom and unindexed tabs and skips a changed list", async () => {
   const key = "local-closed-tabs";
   const open = "20260101000000-openbox";
@@ -232,6 +257,156 @@ test("tree drag moves by ID and rejects descendants and external files", async (
   listeners.drop(event("folder"));
   await pending;
   assert.deepEqual(calls, [["/api/filetree/moveDocsByID", "source", "folder"]]);
+});
+
+test("moving a folder updates both branches immediately and a stale index cannot undo the move", async () => {
+  const plugin = directoryRefreshFixture();
+  const source = { id: "source", box: "book-a", path: "/original/source.sy", hpath: "/来源/资料" };
+  const child = { id: "child", box: "book-a", path: "/original/source/child.sy", hpath: "/来源/资料/子页" };
+  const destination = { id: "target", box: "book-a", path: "/target.sy", hpath: "/目标" };
+  const stale = [source, child, destination];
+  plugin.nav.boxDocs = stale;
+  plugin.nav.expanded.add(source.path);
+  plugin.nav.closed = new Set([destination.path]);
+  let indexRows = stale;
+  let finishRefresh;
+  let refreshStarted;
+  const started = new Promise(resolve => { refreshStarted = resolve; });
+  plugin.api = async endpoint => endpoint.endsWith("/sql") ? indexRows : null;
+  plugin.afterDocChange = () => new Promise(resolve => { finishRefresh = resolve; refreshStarted(); });
+  const move = plugin.moveDocTo(source, destination.id);
+  await started;
+  const expectedPaths = ["/target.sy", "/target/source.sy", "/target/source/child.sy"];
+  assert.deepEqual(Array.from(plugin.nav.boxDocs, row => row.path), expectedPaths);
+  assert.deepEqual([...plugin.nav.expanded], ["/target/source.sy", "/target.sy"]);
+  assert.equal(plugin.nav.closed.has(destination.path), false);
+  assert.deepEqual(Array.from(await plugin.fetchBoxDocs("book-a"), row => row.path).sort(), expectedPaths.slice().sort());
+  assert.equal(plugin.pendingDocs.size, 2);
+  indexRows = plugin.nav.boxDocs;
+  await plugin.fetchBoxDocs("book-a");
+  assert.equal(plugin.pendingDocs.size, 0);
+  finishRefresh();
+  await move;
+});
+
+test("a cross-notebook move hides the old indexed row and shows its subtree in the destination", async () => {
+  const plugin = directoryRefreshFixture();
+  const source = { id: "source", box: "book-a", path: "/original/source.sy", hpath: "/来源/资料" };
+  const child = { id: "child", box: "book-a", path: "/original/source/child.sy", hpath: "/来源/资料/子页" };
+  plugin.nav.boxDocs = [source, child];
+  plugin.afterDocChange = async () => {};
+  plugin.api = async (endpoint, body) => endpoint.endsWith("/sql") && body.stmt.includes("box='book-a'") ? [source, child] : [];
+  await plugin.moveDocTo(source, "book-b");
+  assert.equal(plugin.nav.boxDocs.length, 0);
+  assert.equal((await plugin.fetchBoxDocs("book-a")).length, 0);
+  assert.deepEqual(Array.from(await plugin.fetchBoxDocs("book-b"), row => [row.box, row.path, row.hpath]), [
+    ["book-b", "/source.sy", "/资料"], ["book-b", "/source/child.sy", "/资料/子页"]
+  ]);
+});
+
+test("a failed move leaves the current directory and pending rows untouched", async () => {
+  const plugin = directoryRefreshFixture();
+  const source = { id: "source", box: "book-a", path: "/source.sy", hpath: "/资料" };
+  const rows = plugin.nav.boxDocs = [source];
+  plugin.api = async () => { throw Error("move rejected"); };
+  await assert.rejects(plugin.moveDocTo(source, "book-b"), /move rejected/);
+  assert.equal(plugin.nav.boxDocs, rows);
+  assert.equal(plugin.pendingDocs.size, 0);
+});
+
+test("renaming a folder survives an old index response and updates only its own descendants", async () => {
+  const plugin = directoryRefreshFixture();
+  const folder = { id: "folder", box: "book-a", path: "/folder.sy", hpath: "/旧名称", content: "旧名称" };
+  const child = { id: "child", box: "book-a", path: "/folder/child.sy", hpath: "/旧名称/子页", content: "子页" };
+  const unrelated = { ...child, id: "unrelated", path: "/other/unrelated.sy" };
+  let indexed = [folder, child, unrelated];
+  plugin.nav.boxDocs = indexed.map(row => ({ ...row }));
+  plugin.api = async () => indexed;
+  plugin.patchDocLocal(folder, "新名称");
+  const patched = ["/新名称", "/新名称/子页", "/旧名称/子页"];
+  assert.deepEqual(Array.from(await plugin.fetchBoxDocs("book-a"), row => row.hpath), patched);
+  assert.equal(plugin.pendingDocs.size, 2);
+  indexed = plugin.nav.boxDocs;
+  await plugin.fetchBoxDocs("book-a");
+  assert.equal(plugin.pendingDocs.size, 0);
+});
+
+test("toggling a folder flag survives stale data and preserves the whiteboard attribute", async () => {
+  const plugin = directoryRefreshFixture();
+  const row = { id: "page", box: "book-a", path: "/page.sy", hpath: "/白板", ial: '{: custom-cloud-document-kind="whiteboard"}' };
+  let indexed = [{ ...row }];
+  plugin.nav.boxDocs = [row];
+  plugin.api = async endpoint => endpoint.endsWith("/sql") ? indexed : null;
+  plugin.afterDocChange = async () => {};
+  await plugin.setFolderFlag(row, true);
+  assert.match((await plugin.fetchBoxDocs("book-a"))[0].ial, /custom-cdh-folder="true"/);
+  assert.match(row.ial, /custom-cloud-document-kind="whiteboard"/);
+  indexed = [{ ...row }];
+  await plugin.fetchBoxDocs("book-a");
+  assert.equal(plugin.pendingDocs.size, 0);
+  await plugin.setFolderFlag(row, false);
+  const cleared = (await plugin.fetchBoxDocs("book-a"))[0].ial;
+  assert.doesNotMatch(cleared, /custom-cdh-folder/);
+  assert.match(cleared, /custom-cloud-document-kind="whiteboard"/);
+});
+
+test("a duplicate appears under its physical parent even if folder titles are identical", async () => {
+  const plugin = directoryRefreshFixture();
+  const folder = { id: "folder", box: "book-a", path: "/folder.sy", hpath: "/同名" };
+  const other = { ...folder, id: "other", path: "/other.sy" };
+  plugin.nav.boxDocs = [other, folder];
+  plugin.api = async () => ({ id: "copy", notebook: "book-a", path: "/folder/copy.sy", hPath: "/同名/副本" });
+  plugin.afterDocChange = async () => {};
+  await plugin.duplicateDoc({ box: "book-a", id: "original" });
+  assert.equal(plugin.nav.boxDocs.find(row => row.id === "copy").path, "/folder/copy.sy");
+  assert.deepEqual([...plugin.nav.expanded], [folder.path]);
+});
+
+test("notebook counts reflect local create, subtree move and delete without double counting an updated index", async () => {
+  const plugin = directoryRefreshFixture();
+  plugin.loadConfig = async () => ({});
+  const root = { id: "root", box: "book-a", path: "/root.sy", hpath: "/根" };
+  const child = { id: "child", box: "book-a", path: "/root/child.sy", hpath: "/根/子页" };
+  const fresh = { id: "new", box: "book-a", path: "/new.sy", hpath: "/新文档" };
+  plugin.nav.boxDocs = [root, child];
+  let indexed = [root, child];
+  plugin.api = async (endpoint, body) => {
+    if (endpoint.endsWith("/lsNotebooks")) return { notebooks: [{ id: "book-a" }, { id: "book-b" }] };
+    assert.match(body.stmt, /COUNT/);
+    return [...["book-a", "book-b"].map(box => ({ id: "", box, c: indexed.filter(row => row.box === box).length })),
+      ...indexed.filter(row => body.stmt.includes(`'${row.id}'`)).map(row => ({ id: row.id, box: row.box }))];
+  };
+  const sidebar = await plugin.fetchNavState();
+  const counts = state => [state.countMap["book-a"] || 0, state.countMap["book-b"] || 0];
+  assert.deepEqual(counts(sidebar), [2, 0]);
+  plugin.addDocLocal(fresh);
+  assert.deepEqual(counts(sidebar), [3, 0]);
+  plugin.patchMovedDocs(root, null, "book-b", plugin.nav.boxDocs);
+  assert.deepEqual(counts(sidebar), [1, 2]);
+  assert.deepEqual(counts(await plugin.fetchNavState()), [1, 2]);
+  indexed = [fresh, ...[root, child].map(row => ({ ...row, box: "book-b" }))];
+  assert.deepEqual(counts(await plugin.fetchNavState()), [1, 2]);
+  plugin.dropDocLocal(fresh.id, fresh.box);
+  assert.deepEqual(counts(await plugin.fetchNavState()), [0, 2]);
+  indexed = indexed.filter(row => row.id !== fresh.id);
+  assert.deepEqual(counts(await plugin.fetchNavState()), [0, 2]);
+});
+
+test("a count query in flight when a document is created is retried with the new document ID", async () => {
+  const plugin = directoryRefreshFixture();
+  let firstResponse;
+  const queries = [];
+  plugin.api = async (endpoint, { stmt }) => {
+    queries.push(stmt);
+    if (queries.length === 1) return new Promise(resolve => { firstResponse = resolve; });
+    return [{ id: "", box: "book-a", c: 1 }, { id: "new", box: "book-a", c: 0 }];
+  };
+  const poll = plugin.fetchCountSnapshot();
+  plugin.addDocLocal({ id: "new", box: "book-a", path: "/new.sy", hpath: "/新文档" });
+  firstResponse([{ id: "", box: "book-a", c: 1 }]);
+  assert.equal(plugin.projectCounts(await poll)["book-a"], 1);
+  assert.equal(queries.length, 2);
+  assert.match(queries[1], /id IN \('new'\)/);
 });
 
 test("new document defaults to the clicked folder and creates under its ID", async () => {
@@ -475,7 +650,7 @@ test("deleted subtree cannot return from a stale SQL response and same-name sibl
   plugin.api = async () => rows.map(row=>({...row}));
   plugin.dropDocLocal("folder");
   assert.deepEqual(plugin.nav.boxDocs.map(row=>row.id), ["other"]);
-  assert.deepEqual((await plugin.fetchBoxDocs("book")).map(row=>row.id), ["other"]);
+  assert.deepEqual(Array.from(await plugin.fetchBoxDocs("book"), row => row.id), ["other"]);
   assert.equal(plugin.pendingDocs.has("child"), false);
   plugin.api = async () => [rows[2]];
   await plugin.fetchBoxDocs("book");

@@ -390,8 +390,11 @@ class CloudDocsHome extends Plugin {
         detail.data.some(transaction => (transaction.doOperations || []).some(operation =>
           operation.action === "create" || operation.action === "restoreCreatedDoc"));
       if (structuralTransaction || ["removeDoc", "moveDoc", "moveDocs", "rename", "createdailynote", "heading2doc", "li2doc"].includes(detail?.cmd)) {
-        if (structuralTransaction && detail.data.some(transaction =>
-          (transaction.doOperations || []).some(operation => operation.action === "restoreCreatedDoc"))) this.deletedDocs.clear();
+      if (structuralTransaction && detail.data.some(transaction =>
+          (transaction.doOperations || []).some(operation => operation.action === "restoreCreatedDoc"))) {
+          for (const [id, change] of this.countChanges || []) if (!change.after) this.countChanges.delete(id);
+          this.deletedDocs.clear();
+        }
         this.navView?.render();
         this.syncViews();
         clearTimeout(this.documentEventTimer);
@@ -542,12 +545,54 @@ class CloudDocsHome extends Plugin {
     await this.loadConfig();
     const [nbData, counts] = await Promise.all([
       this.api("/api/notebook/lsNotebooks", {}),
-      this.api("/api/query/sql", { stmt: "SELECT box, COUNT(id) AS c FROM blocks WHERE type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %' GROUP BY box" })
+      this.fetchCountSnapshot()
     ]);
     const notebooks = (nbData.notebooks || []).slice().sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0));
-    const countMap = {};
-    for (const r of counts || []) countMap[r.box] = r.c;
-    return { notebooks, openNotebooks: notebooks.filter(n => !n.closed), countMap };
+    const plugin = this;
+    return { notebooks, openNotebooks: notebooks.filter(n => !n.closed), get countMap() { return plugin.projectCounts(counts); } };
+  }
+
+  async fetchCountSnapshot() {
+    const changes = this.countChanges;
+    for (const [id, change] of changes || []) {
+      if (Date.now() - change.at > 30000) changes.delete(id);
+    }
+    const where = "type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %'";
+    const totals = `SELECT '' AS id, box, COUNT(id) AS c FROM blocks WHERE ${where} GROUP BY box`;
+    while (true) {
+      const revision = this.countRevision;
+      const ids = [...(this.countChanges?.keys() || [])];
+      const positions = ids.length ? ` UNION ALL SELECT id, box, 0 AS c FROM blocks WHERE ${where} AND id IN (${ids.map(id => `'${sqlSafe(id)}'`).join(",")})` : "";
+      // Read totals and changed document locations in the same SQL snapshot.
+      const rows = await this.api("/api/query/sql", { stmt: totals + positions });
+      if (revision === this.countRevision) return { rows: rows || [], ids: new Set(ids) };
+    }
+  }
+
+  projectCounts(snapshot) {
+    const counts = {};
+    const indexed = new Map();
+    for (const row of snapshot.rows) {
+      if (row.id) indexed.set(row.id, row.box);
+      else counts[row.box] = Number(row.c);
+    }
+    for (const [id, change] of this.countChanges || []) {
+      const from = snapshot.ids.has(id) ? indexed.get(id) : change.before;
+      const to = change.after;
+      if (from === to) continue;
+      if (from) counts[from] = Math.max(0, (counts[from] || 0) - 1);
+      if (to) counts[to] = (counts[to] || 0) + 1;
+    }
+    return counts;
+  }
+
+  rememberCountChange(id, before, after) {
+    if (before === after) return;
+    this.countChanges ||= new Map();
+    const previous = this.countChanges.get(id);
+    if (previous && previous.after === after) return;
+    this.countChanges.set(id, { before: previous ? previous.before : before, after, at: Date.now() });
+    this.countRevision = (this.countRevision || 0) + 1;
   }
 
   /** 刷新所有内容视图（可能有多个标签页/空白页实例） */
@@ -941,25 +986,26 @@ class CloudDocsHome extends Plugin {
   async fetchState() {
     const [nbData, docs, counts] = await Promise.all([
       this.api("/api/notebook/lsNotebooks", {}),
-      this.api("/api/query/sql", { stmt: "SELECT id, box, hpath, content, updated FROM blocks WHERE type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %' ORDER BY updated DESC LIMIT 400" }),
-      this.api("/api/query/sql", { stmt: "SELECT box, COUNT(id) AS c FROM blocks WHERE type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %' GROUP BY box" })
+      this.api("/api/query/sql", { stmt: "SELECT id, box, path, hpath, content, updated FROM blocks WHERE type='d' AND id != box AND COALESCE(content,'') NOT LIKE '%(Conflicted %' ORDER BY updated DESC LIMIT 400" }),
+      this.fetchCountSnapshot()
     ]);
     const notebooks = (nbData.notebooks || []).slice().sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0));
     const openNotebooks = notebooks.filter(n => !n.closed);
     const closedCount = notebooks.length - openNotebooks.length;
     const openBoxes = new Set(openNotebooks.map(n => n.id));
-    const rows = (docs || []).filter(r => openBoxes.has(r.box) && !this.hideDeletedDoc(r.id));
-    for (const [id, item] of this.pendingDocs || []) {
-      if (openBoxes.has(item.row.box) && !this.deletedDocs?.has(id) && !rows.some(row => row.id === id)) rows.push(item.row);
-    }
+    const rows = this.mergePendingDocs(docs || []).filter(r => openBoxes.has(r.box) && !this.hideDeletedDoc(r.id));
     rows.sort((a, b) => String(b.updated || "").localeCompare(String(a.updated || "")));
-    const countMap = {}; for (const r of counts || []) countMap[r.box] = r.c;
     const newestByBox = {}; const seen = new Set();
     for (const r of rows) if (!seen.has(r.box)) { seen.add(r.box); newestByBox[r.box] = r; }
     const boxName = {}; for (const n of notebooks) boxName[n.id] = splitNotebookName(n.name).text;
-    const totalDocs = openNotebooks.reduce((sum, n) => sum + (countMap[n.id] || 0), 0);
+    const plugin = this;
     return {
-      notebooks, openNotebooks, closedCount, rows, countMap, newestByBox, boxName, totalDocs,
+      notebooks, openNotebooks, closedCount, rows, newestByBox, boxName,
+      get countMap() { return plugin.projectCounts(counts); },
+      get totalDocs() {
+        const countMap = this.countMap;
+        return openNotebooks.reduce((sum, n) => sum + (countMap[n.id] || 0), 0);
+      },
       recent: rows.slice(0, 8),
       config: await this.loadConfig()
     };
@@ -1003,21 +1049,41 @@ class CloudDocsHome extends Plugin {
   /** 取某个笔记本下的全部文档（含 hpath 层级路径），用于库目录树。
    *  这里不做过过滤，冲突副本由渲染层收进「同步冲突」入口，避免把数据藏死。 */
   async fetchBoxDocs(box) {
-    const rows = await this.api("/api/query/sql", {
+    const indexed = await this.api("/api/query/sql", {
       stmt: `SELECT id, box, path, hpath, content, updated, ial FROM blocks WHERE type='d' AND box='${sqlSafe(box)}' ORDER BY hpath LIMIT 3000`
     }) || [];
-    // 把还没被索引的新文档补回去；索引追上后自动移除（超过 30 秒没人认领就丢弃）
-    for (const [id, item] of [...this.pendingDocs]) {
-      if (Date.now() - item.at > 30000) { this.pendingDocs.delete(id); continue; }
-      if (item.row.box !== box) continue;
-      if (rows.some(r => r.id === id)) { this.pendingDocs.delete(id); continue; }
-      rows.push(item.row);
-    }
+    const rows = this.mergePendingDocs(indexed, box, true);
     const deleted = this.deletedDocs || new Map();
     for (const [id, item] of deleted) {
       if (item.box === box && !rows.some(row => row.id === id)) deleted.delete(id);
     }
     return rows.filter(row => !this.hideDeletedDoc(row.id));
+  }
+
+  mergePendingDocs(indexed, box, reconcile = false) {
+    const rows = new Map(indexed.map(row => [row.id, row]));
+    for (const [id, { row, at, moved, expected }] of this.pendingDocs || []) {
+      if (Date.now() - at > 30000) { this.pendingDocs.delete(id); continue; }
+      if (this.deletedDocs?.has(id)) continue;
+      if (box && row.box !== box) {
+        if (moved) rows.delete(id);
+        continue;
+      }
+      const hit = rows.get(id);
+      if (hit && (!moved || (hit.box === row.box && hit.path === row.path)) &&
+          (!expected?.hpath || expected.hpath === hit.hpath) &&
+          (!box || expected?.folder === undefined || expected.folder === isFolderRow(hit))) {
+        if (reconcile) this.pendingDocs.delete(id);
+      } else {
+        rows.set(id, row);
+      }
+    }
+    return [...rows.values()];
+  }
+
+  rememberDocPatch(row, expected) {
+    const prior = this.pendingDocs.get(row.id);
+    this.pendingDocs.set(row.id, { ...prior, row: { ...row }, at: Date.now(), expected: { ...prior?.expected, ...expected } });
   }
 
   hideDeletedDoc(id) {
@@ -1049,8 +1115,10 @@ class CloudDocsHome extends Plugin {
     return true;
   }
 
-  async onSuiteDocumentCreated(entry) {
-    if (this.addSuiteDocument(entry)) await this.afterDocChange();
+  async onSuiteDocumentCreated(detail) {
+    const entries = Array.isArray(detail) ? detail : [detail];
+    const added = entries.filter(entry => this.addSuiteDocument(entry));
+    if (added.length) await this.afterDocChange();
   }
 
   async revealImportedDocument(entry) {
@@ -1102,18 +1170,20 @@ class CloudDocsHome extends Plugin {
   }
 
   /** 内核 SQL 索引有几秒延迟，改完先在本地树上改掉，用户才觉得"点一下就生效" */
-  patchDocLocal(id, title) {
-    const rows = this.nav.boxDocs;
-    if (!rows) return;
-    const hit = rows.find(r => r.id === id);
-    if (!hit) return;
+  patchDocLocal(doc, title) {
+    const rows = this.nav.boxDocs || [];
+    const hit = rows.find(r => r.id === doc.id) || { ...doc };
     const oldHp = String(hit.hpath || "");
     const newHp = oldHp.replace(/[^/]*$/, title);
     hit.content = title;
     hit.hpath = newHp;
+    this.rememberDocPatch(hit, { hpath: newHp });
     for (const r of rows) {
       const hp = String(r.hpath || "");
-      if (hp.startsWith(oldHp + "/") && (!hit.path || this.isSelfOrDescendant(hit, r))) r.hpath = newHp + hp.slice(oldHp.length);
+      if (hp.startsWith(oldHp + "/") && (!hit.path || this.isSelfOrDescendant(hit, r))) {
+        r.hpath = newHp + hp.slice(oldHp.length);
+        this.rememberDocPatch(r, { hpath: r.hpath });
+      }
     }
   }
 
@@ -1131,8 +1201,10 @@ class CloudDocsHome extends Plugin {
       : hp && row.box === hit.box && String(row.hpath || "").startsWith(hp + "/"));
     const knownBox = box || hit?.box || this.pendingDocs.get(id)?.row.box || this.deletedDocs.get(id)?.box;
     this.deletedDocs.set(id, { box: knownBox, at });
+    if (knownBox && (!hit || isVisibleDoc(hit))) this.rememberCountChange(id, knownBox, undefined);
     for (const row of [...rows, ...Array.from(this.pendingDocs.values(), item => item.row)]) {
       if (!isDeleted(row)) continue;
+      if (isVisibleDoc(row)) this.rememberCountChange(row.id, row.box, undefined);
       this.deletedDocs.set(row.id, { box: row.box, at });
       this.pendingDocs.delete(row.id);
     }
@@ -1151,6 +1223,7 @@ class CloudDocsHome extends Plugin {
     this.deletedDocs?.delete(row.id);
     this.pendingDocs.set(row.id, { row, at: Date.now() });
     const rows = this.nav.boxDocs;
+    if (isVisibleDoc(row) && !rows?.some(r => r.id === row.id)) this.rememberCountChange(row.id, undefined, row.box);
     if (!rows || (this.nav.openBoxId && this.nav.openBoxId !== row.box)) return;
     if (!rows.some(r => r.id === row.id)) rows.push(row);
     const parent = row.path && row.path.lastIndexOf("/") > 0
@@ -1192,7 +1265,7 @@ class CloudDocsHome extends Plugin {
     if (!ok) return;
     if (title === String(doc.content || "")) return;
     await this.api("/api/filetree/renameDocByID", { id: doc.id, title });
-    this.patchDocLocal(doc.id, title);
+    this.patchDocLocal(doc, title);
     this.navView?.render();
     showMessage("已重命名", 1800);
     await this.afterDocChange();
@@ -1288,8 +1361,10 @@ class CloudDocsHome extends Plugin {
       showMessage("操作失败：" + (e?.message || e), 3600, "error");
       return;
     }
-    const hit = (this.nav.boxDocs || []).find(r => r.id === doc.id);
-    if (hit) hit.ial = on ? 'custom-cdh-folder="true"' : "";
+    const hit = (this.nav.boxDocs || []).find(r => r.id === doc.id) || { ...doc };
+    const ial = String(hit.ial || "").replace(/(^|[\s{])custom-cdh-folder\s*=\s*(?:"[^"]*"|[^\s}]+)/g, "$1").trim();
+    hit.ial = on ? `${ial.replace(/}$/, "")} custom-cdh-folder="true"${ial.endsWith("}") ? "}" : ""}`.trim() : ial;
+    this.rememberDocPatch(hit, { folder: on });
     this.navView?.render();
     showMessage(on ? "已标记为文件夹" : "已取消文件夹标记", 1800);
     await this.afterDocChange();
@@ -1300,8 +1375,8 @@ class CloudDocsHome extends Plugin {
     const hp = String(data?.hPath || "");
     if (data?.id && hp) {
       this.addDocLocal({
-        id: data.id, box: data.notebook || doc.box, hpath: hp,
-        content: hp.split("/").filter(Boolean).pop() || "", updated: this.stampNow()
+        id: data.id, box: data.notebook || doc.box, path: data.path, hpath: hp,
+        content: hp.split("/").filter(Boolean).pop() || "", updated: this.stampNow(), ial: doc.ial
       });
     }
     this.navView?.render();
@@ -1377,15 +1452,65 @@ class CloudDocsHome extends Plugin {
       }
     });
     if (!ok || !target) return;
-    await this.moveDocTo(doc, target.parent || target.box);
+    await this.moveDocTo(doc, target.parent || target.box, target.box);
   }
 
-  async moveDocTo(doc, toID) {
+  async moveDocTo(doc, toID, targetBox = toID) {
     if (toID === doc.id) throw Error("不能移动到它自己下面");
+    let destination = this.nav.boxDocs?.find(row => row.id === toID);
+    if (!destination && toID !== targetBox) {
+      const [location, hpath] = await Promise.all([
+        this.api("/api/filetree/getPathByID", { id: toID }),
+        this.api("/api/filetree/getHPathByID", { id: toID })
+      ]);
+      destination = { box: location.notebook, path: location.path, hpath };
+    }
+    const sourceRows = this.nav.boxDocs || [];
     await this.api("/api/filetree/moveDocsByID", { fromIDs: [doc.id], toID });
-    this.pendingDocs.delete(doc.id);
+    this.patchMovedDocs(doc, destination, targetBox, sourceRows);
     showMessage("已移动", 1800);
     await this.afterDocChange();
+  }
+
+  patchMovedDocs(doc, destination, targetBox, sourceRows) {
+    const nav = this.nav;
+    const box = destination?.box || targetBox;
+    const sourcePrefix = (doc.path || "").replace(/\.sy$/, "");
+    const sourceHpath = doc.hpath || "";
+    const nextPrefix = `${(destination?.path || "").replace(/\.sy$/, "")}/${doc.id}`;
+    const nextHpath = `${destination?.hpath || ""}/${sourceHpath.split("/").at(-1) || doc.content || doc.id}`;
+    if (doc.box === box && doc.path === nextPrefix + ".sy") return;
+    const candidates = new Map([doc, ...sourceRows, ...(nav.boxDocs || []), ...Array.from(this.pendingDocs.values(), item => item.row)]
+      .filter(row => this.isSelfOrDescendant(doc, row)).map(row => [row.id, row]));
+    for (const row of candidates.values()) {
+      const isRoot = row.id === doc.id;
+      const moved = {
+        ...row, box,
+        path: nextPrefix + (isRoot ? ".sy" : row.path.slice(sourcePrefix.length)),
+        hpath: nextHpath + (isRoot ? "" : String(row.hpath || "").slice(sourceHpath.length))
+      };
+      const prior = this.pendingDocs.get(row.id);
+      const expected = prior?.expected?.hpath ? { ...prior.expected, hpath: moved.hpath } : prior?.expected;
+      this.pendingDocs.set(row.id, { row: moved, at: Date.now(), moved: true, expected });
+      if (isVisibleDoc(row)) this.rememberCountChange(row.id, row.box, box);
+    }
+    if (nav.boxDocs && nav.openBoxId) nav.boxDocs = this.mergePendingDocs(nav.boxDocs.filter(row => !candidates.has(row.id)), nav.openBoxId);
+    if (nav.openBoxId === box) {
+      if (doc.box === box && sourcePrefix) {
+        for (const paths of [nav.expanded, nav.closed]) {
+          for (const old of [...(paths || [])]) {
+            if (old !== doc.path && !old.startsWith(sourcePrefix + "/")) continue;
+            paths.delete(old);
+            paths.add(nextPrefix + old.slice(sourcePrefix.length));
+          }
+        }
+      }
+      if (destination?.path) {
+        nav.expanded.add(destination.path);
+        nav.closed?.delete(destination.path);
+      }
+      this.saveExpanded();
+    }
   }
 
   async copyMarkdown(doc) {
@@ -1740,8 +1865,14 @@ class NavView {
   };
 
   async refresh() {
-    try { this.state = await this.plugin.fetchNavState(); }
+    const request = this.refreshRequest = (this.refreshRequest || 0) + 1;
+    try {
+      const state = await this.plugin.fetchNavState();
+      if (this.disposed || request !== this.refreshRequest) return;
+      this.state = state;
+    }
     catch (e) {
+      if (this.disposed || request !== this.refreshRequest) return;
       this.el.innerHTML = `<div class="cdh-side-tip cdh-error">导航加载失败：${esc(e?.message || e)}</div>`;
       return;
     }
