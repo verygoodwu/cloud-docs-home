@@ -21,6 +21,58 @@ function directoryRefreshFixture() {
 
 const documentInBookB = { id: "doc-b", box: "book-b", path: "/doc-b.sy", hpath: "/示例" };
 
+test("revealing an import expands its collapsed ancestors, highlights only the imported row and scrolls to it", async () => {
+  const plugin = directoryRefreshFixture();
+  const folder = { id: "outer", box: "book-a", path: "/outer.sy", hpath: "/外层" };
+  const nested = { id: "inner", box: "book-a", path: "/outer/inner.sy", hpath: "/外层/内层" };
+  const imported = { id: "new", box: "book-a", path: "/outer/inner/new.sy", hpath: "/外层/内层/新文件.mm", title: "新文件.mm", kind: "mindmap" };
+  plugin.nav.boxDocs = [folder, nested];
+  plugin.nav.closed = new Set([folder.path, nested.path, "/other.sy"]);
+  plugin.lifecycle = new AbortController();
+  plugin.fetchOutline = async () => ({ title: imported.title, outline: [] });
+  plugin.fetchBacklinks = async () => [];
+  plugin.showHome = () => assert.fail("revealing an import must keep its editor visible");
+
+  const view = Object.create(NavView.prototype);
+  let scrollCount = 0;
+  let html = "";
+  const scroll = { scrollTop: 0, querySelector: () => html.includes("is-current") ? {
+    dataset: { id: imported.id }, scrollIntoView: () => scrollCount++
+  } : null };
+  Object.assign(view, {
+    plugin, state: {},
+    sideHTML: () => view.renderTree(view.buildTree(plugin.nav.boxDocs)),
+    el: { querySelector: () => scroll, set innerHTML(value) { html = value; } }
+  });
+  plugin.navView = view;
+
+  await plugin.revealImportedDocument(imported);
+  assert.match(html, /class="cdh-tree-row is-current"[^>]*data-id="new"/);
+  assert.equal(html.match(/is-current/g).length, 1);
+  assert.equal(scrollCount, 1);
+  assert.deepEqual([...plugin.nav.closed], ["/other.sy"]);
+  assert.equal(plugin.pendingDocs.has(imported.id), true);
+});
+
+test("revealing an import in another notebook switches the sidebar without opening home", async () => {
+  const plugin = directoryRefreshFixture();
+  const selections = [];
+  plugin.nav.closed = new Set();
+  plugin.navView = { render() {}, revealDoc: id => selections.push(id) };
+  plugin.lifecycle = new AbortController();
+  plugin.loadExpanded = () => ({ open: new Set(), closed: new Set() });
+  plugin.fetchBoxDocs = async box => [...plugin.pendingDocs.values()].map(item => item.row).filter(row => row.box === box);
+  plugin.fetchOutline = async () => ({ title: "示例", outline: [] });
+  plugin.fetchBacklinks = async () => [];
+  plugin.showHome = () => assert.fail("revealing an import must keep its editor visible");
+  plugin.syncViews = () => {};
+
+  await plugin.revealImportedDocument({ ...documentInBookB, title: "示例" });
+  assert.equal(plugin.nav.openBoxId, documentInBookB.box);
+  assert.equal(plugin.nav.boxDocs[0].id, documentInBookB.id);
+  assert.deepEqual(selections, [documentInBookB.id]);
+});
+
 test("creating in another notebook does not insert into the open directory", () => {
   const plugin = directoryRefreshFixture();
   plugin.addDocLocal({ ...documentInBookB });

@@ -401,6 +401,12 @@ class CloudDocsHome extends Plugin {
       }
     };
     this.eventBus.on("ws-main", this.onClosedTabDelete);
+    document.addEventListener("cloud-docs-home:reveal-imported-document", event => {
+      const entry = event.detail;
+      if (!entry?.id || !entry.box || !entry.path || !entry.hpath || !this.navVisible()) return;
+      event.preventDefault();
+      this.revealImportedDocument(entry).catch(error => this.trace?.("import navigation failed: " + error.message));
+    }, { signal: this.lifecycle.signal });
   }
 
   onLayoutReady() {
@@ -559,7 +565,8 @@ class CloudDocsHome extends Plugin {
     if (!box) return;
     const nav = this.nav;
     if (!opts.force && nav.openBoxId === box && nav.boxDocs) {
-      this.showHome(); this.syncViews(); this.navView?.render();
+      if (!opts.keepEditor) this.showHome();
+      this.syncViews(); this.navView?.render();
       return;
     }
     const request = this.boxDocsRequest = (this.boxDocsRequest || 0) + 1;
@@ -569,7 +576,7 @@ class CloudDocsHome extends Plugin {
     const st = this.loadExpanded(box);
     nav.expanded = st.open; nav.closed = st.closed;
     nav.showConflicts = false;
-    this.showHome();
+    if (!opts.keepEditor) this.showHome();
     this.syncViews();
     this.navView?.render();
     try {
@@ -624,8 +631,7 @@ class CloudDocsHome extends Plugin {
   }
 
   /** 跟随当前文档：把大纲与反链拉进导航（原生面板一个都不开） */
-  async syncDocContext() {
-    const id = this.currentDocId();
+  async syncDocContext(id = this.currentDocId()) {
     if (id === this.docCtxId) return;
     this.docCtxId = id;
     if (!id) { this.docCtx = null; this.navView?.render(); return; }
@@ -1029,6 +1035,17 @@ class CloudDocsHome extends Plugin {
   async openDoc(id) {
     try { await openTab({ app: this.app, doc: { id } }); }
     catch (e) { showMessage("打开文档失败：" + (e?.message || e), 3000, "error"); }
+  }
+
+  async revealImportedDocument(entry) {
+    const { id, box, path, hpath, title, kind } = entry;
+    const row = { id, box, path, hpath, content: title, updated: this.stampNow() };
+    if (typeof kind === "string" && /^[a-z-]+$/.test(kind)) row.ial = `custom-cloud-document-kind="${kind}"`;
+    this.addDocLocal(row);
+    void this.syncDocContext(id);
+    if (this.nav.openBoxId !== box || !this.nav.boxDocs) await this.goBox(box, { keepEditor: true });
+    if (this.lifecycle.signal.aborted || this.nav.openBoxId !== box || this.docCtxId !== id) return;
+    this.navView?.revealDoc(id);
   }
 
   /* ---------- 文档操作 ----------
@@ -1725,6 +1742,20 @@ class NavView {
     this.el.innerHTML = this.sideHTML();
     const next = this.el.querySelector(".cdh-side-scroll");
     if (next) next.scrollTop = prev;
+    if (this.revealId && this.revealId !== this.plugin.docCtxId) this.revealId = null;
+    if (this.revealId) {
+      const row = next?.querySelector(".cdh-tree-row.is-current");
+      if (row?.dataset.id === this.revealId) {
+        row.scrollIntoView({ block: "nearest", inline: "nearest" });
+        this.revealId = null;
+      }
+    }
+  }
+
+  revealDoc(id) {
+    for (const path of this.currentTrail()) this.plugin.nav.closed.delete(path);
+    this.revealId = id;
+    this.render();
   }
 
   sideHTML() {
